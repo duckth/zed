@@ -423,7 +423,11 @@ impl TextFinder {
         let project = delegate.project(cx).clone();
         let languages = project.read(cx).languages().clone();
         let preview = picker_preview::editor_preview(project, window, cx);
-        let query_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let query_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_use_modal_editing(true);
+            editor
+        });
         let erased_query_editor = query_editor.update(cx, |editor, cx| editor.erased(cx));
         let picker = cx.new(|cx| {
             Picker::list_with_preview_and_query_editor(

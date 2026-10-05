@@ -43,3 +43,7 @@ pub enum ErasedEditorEvent {
 }
 pub static ERASED_EDITOR_FACTORY: OnceLock<fn(&mut Window, &mut App) -> Arc<dyn ErasedEditor>> =
     OnceLock::new();
+/// Like [`ERASED_EDITOR_FACTORY`], but the editor opts into modal editing (e.g. Vim mode).
+pub static ERASED_MODAL_EDITOR_FACTORY: OnceLock<
+    fn(&mut Window, &mut App) -> Arc<dyn ErasedEditor>,
+> = OnceLock::new();

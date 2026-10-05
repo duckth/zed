@@ -1084,6 +1084,35 @@ pub struct VimSettingsContent {
     /// When enabled, edit predictions are shown in Vim normal mode.
     /// By default, edit predictions are only shown in insert and replace modes.
     pub show_edit_predictions_in_normal_mode: Option<bool>,
+    /// Whether to use Vim mode in picker query editors (e.g. the file finder),
+    /// and which mode they open in. In normal mode, `escape` closes the picker.
+    ///
+    /// Default: disabled
+    pub picker_mode: Option<PickerModeContent>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Debug,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerModeContent {
+    /// Picker query editors are plain text inputs.
+    #[default]
+    Disabled,
+    /// Picker query editors use Vim mode and open in normal mode.
+    Normal,
+    /// Picker query editors use Vim mode and open in insert mode.
+    Insert,
 }
 
 #[derive(

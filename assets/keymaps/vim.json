@@ -233,7 +233,7 @@
       "i": "vim::InsertBefore",
       "a": "vim::InsertAfter",
       "ctrl-[": "editor::Cancel",
-      ":": "command_palette::Toggle",
+      ":": "vim::ToggleCommandLine",
       "c": "vim::PushChange",
       "shift-c": "vim::ChangeToEndOfLine",
       "d": "vim::PushDelete",
@@ -583,7 +583,7 @@
       "space shift-g ctrl-l": "editor::EditLogBreakpoint",
 
       // Other
-      ":": "command_palette::Toggle",
+      ":": "vim::ToggleCommandLine",
       "m": "vim::PushHelixMatch",
       "]": ["vim::PushHelixNext", { "around": true }],
       "[": ["vim::PushHelixPrevious", { "around": true }],
@@ -992,7 +992,7 @@
   {
     "context": "!Editor && !Terminal",
     "bindings": {
-      ":": "command_palette::Toggle",
+      ":": "vim::ToggleCommandLine",
       "g /": "pane::DeploySearch",
       "] b": "pane::ActivateNextItem",
       "[ b": "pane::ActivatePreviousItem",
@@ -1012,7 +1012,7 @@
     // netrw compatibility
     "context": "ProjectPanel && not_editing",
     "bindings": {
-      ":": "command_palette::Toggle",
+      ":": "vim::ToggleCommandLine",
       "%": "project_panel::NewFile",
       "/": "project_panel::NewSearchInDirectory",
       "d": "project_panel::NewDirectory",
@@ -1167,6 +1167,38 @@
       "ctrl-w": "editor::DeleteToPreviousWordStart",
       "ctrl-p": "menu::SelectPrevious",
       "ctrl-n": "menu::SelectNext",
+    },
+  },
+  {
+    // Picker query editors only have Vim mode when `vim.picker_mode` is enabled.
+    "context": "Picker > Editor && VimControl && (vim_mode == normal || vim_mode == helix_normal)",
+    "bindings": {
+      "j": "menu::SelectNext",
+      "k": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "up": "menu::SelectPrevious",
+      "g g": "menu::SelectFirst",
+      "shift-g": "menu::SelectLast",
+      "enter": "menu::Confirm",
+      "tab": "picker::ConfirmCompletion",
+      "escape": "menu::Cancel",
+      "ctrl-[": "menu::Cancel",
+      "ctrl-c": "menu::Cancel",
+    },
+  },
+  {
+    "context": "Picker > Editor && VimControl",
+    "bindings": {
+      // These act on the workspace rather than the query, which would close or confuse the picker.
+      ":": null,
+      "/": null,
+      "?": null,
+      "#": null,
+      "*": null,
+      "n": null,
+      "shift-n": null,
+      "ctrl-o": null,
+      "ctrl-i": null,
     },
   },
   {

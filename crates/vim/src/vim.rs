@@ -289,6 +289,9 @@ pub fn init(cx: &mut App) {
     cx.observe_new(Vim::register).detach();
 
     cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &command::ToggleCommandLine, window, cx| {
+            command::toggle_command_line(workspace, "", window, cx)
+        });
         workspace.register_action(|workspace, _: &ToggleVimMode, _, cx| {
             let fs = workspace.app_state().fs.clone();
             let currently_enabled = VimModeSetting::get_global(cx).0;
@@ -626,11 +629,11 @@ impl Vim {
             return;
         }
 
-        let mut was_enabled = Vim::enabled(cx);
+        let mut was_enabled = Vim::enabled_for_editor(editor, cx);
         let mut was_helix_enabled = HelixModeSetting::get_global(cx).0;
         let mut was_toggle = VimSettings::get_global(cx).toggle_relative_line_numbers;
         cx.observe_global_in::<SettingsStore>(window, move |editor, window, cx| {
-            let enabled = Vim::enabled(cx);
+            let enabled = Vim::enabled_for_editor(editor, cx);
             let helix_enabled = HelixModeSetting::get_global(cx).0;
             let toggle = VimSettings::get_global(cx).toggle_relative_line_numbers;
             if enabled && was_enabled && (toggle != was_toggle) {
@@ -670,6 +673,15 @@ impl Vim {
         let state = vim.update(cx, |vim, cx| {
             if !editor.use_modal_editing() {
                 vim.mode = Mode::Insert;
+            } else if editor.mode().is_single_line() {
+                let picker_mode_override = Vim::globals(cx).picker_mode_override;
+                let picker_mode = VimSettings::get_global(cx).picker_mode;
+                vim.mode = match (picker_mode_override, picker_mode) {
+                    (Some(mode), _) => mode,
+                    (None, settings::PickerModeContent::Insert) => Mode::Insert,
+                    (None, _) if HelixModeSetting::get_global(cx).0 => Mode::HelixNormal,
+                    (None, _) => Mode::Normal,
+                };
             }
 
             vim.state_for_editor_settings(cx)
@@ -1075,6 +1087,14 @@ impl Vim {
 
     pub fn enabled(cx: &mut App) -> bool {
         VimModeSetting::get_global(cx).0 || HelixModeSetting::get_global(cx).0
+    }
+
+    // Single-line editors only opt into modal editing as picker query editors,
+    // which have their own setting.
+    fn enabled_for_editor(editor: &Editor, cx: &mut App) -> bool {
+        Vim::enabled(cx)
+            && (!editor.mode().is_single_line()
+                || VimSettings::get_global(cx).picker_mode != settings::PickerModeContent::Disabled)
     }
 
     /// Called whenever an keystroke is typed so vim can observe all actions
@@ -2349,6 +2369,7 @@ struct VimSettings {
     pub highlight_on_yank_duration: u64,
     pub cursor_shape: CursorShapeSettings,
     pub show_edit_predictions_in_normal_mode: bool,
+    pub picker_mode: settings::PickerModeContent,
 }
 
 /// Cursor shape configuration for insert mode.
@@ -2437,6 +2458,7 @@ impl Settings for VimSettings {
             highlight_on_yank_duration: vim.highlight_on_yank_duration.unwrap(),
             cursor_shape: vim.cursor_shape.unwrap().into(),
             show_edit_predictions_in_normal_mode: vim.show_edit_predictions_in_normal_mode.unwrap(),
+            picker_mode: vim.picker_mode.unwrap(),
         }
     }
 }
