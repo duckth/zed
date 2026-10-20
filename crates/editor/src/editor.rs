@@ -419,6 +419,14 @@ pub fn init(cx: &mut App) {
         cx.new(|cx| Editor::single_line(window, cx))
             .update(cx, |editor, cx| editor.erased(cx))
     });
+    _ = ui_input::ERASED_MODAL_EDITOR_FACTORY.set(|window, cx| {
+        cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_use_modal_editing(true);
+            editor
+        })
+        .update(cx, |editor, cx| editor.erased(cx))
+    });
     _ = multi_buffer::EXCERPT_CONTEXT_LINES.set(multibuffer_context_lines);
 }
 

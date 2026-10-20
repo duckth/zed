@@ -20,7 +20,7 @@ impl Head {
         window: &mut Window,
         cx: &mut Context<V>,
     ) -> Self {
-        let editor = (ui_input::ERASED_EDITOR_FACTORY.get().unwrap())(window, cx);
+        let editor = (ui_input::ERASED_MODAL_EDITOR_FACTORY.get().unwrap())(window, cx);
         Self::with_editor(editor, placeholder_text, edit_handler, window, cx)
     }
 

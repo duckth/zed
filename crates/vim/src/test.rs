@@ -16,12 +16,12 @@ use editor::{
 use futures::StreamExt;
 #[cfg(target_os = "windows")]
 use gpui::AppContext as _;
-use gpui::{KeyBinding, Modifiers, MouseButton, TestAppContext, px};
+use gpui::{KeyBinding, Modifiers, MouseButton, ParentElement as _, TestAppContext, px};
 use itertools::Itertools;
 use language::{CursorShape, Language, LanguageConfig, Point};
 pub use neovim_backed_test_context::*;
 use settings::{CommandAliasTarget, SettingsStore};
-use ui::Pixels;
+use ui::{Pixels, Toggleable as _};
 use util::{path, test::marked_text_ranges};
 pub use vim_test_context::*;
 
@@ -36,7 +36,7 @@ use workspace::notifications::{NotificationId, simple_message_notification::Mess
 use workspace::{DeploySearch, MultiWorkspace};
 
 use crate::{
-    PushSneak, PushSneakBackward, SwitchToNormalMode, VimAddon, insert::NormalBefore, motion,
+    PushSneak, PushSneakBackward, SwitchToNormalMode, Vim, VimAddon, insert::NormalBefore, motion,
     state::Mode,
 };
 
@@ -3437,4 +3437,201 @@ async fn test_project_search_opens_in_normal_mode(cx: &mut gpui::TestAppContext)
 
         assert_eq!(vim_mode, Some(Mode::Normal));
     });
+}
+
+struct TestPickerDelegate {
+    items: Vec<&'static str>,
+    selected_index: usize,
+}
+
+impl picker::PickerDelegate for TestPickerDelegate {
+    type ListItem = ui::ListItem;
+
+    fn name() -> &'static str {
+        "vim_test_picker"
+    }
+
+    fn match_count(&self) -> usize {
+        self.items.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<picker::Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn placeholder_text(&self, _: &mut gpui::Window, _: &mut gpui::App) -> Arc<str> {
+        "Test".into()
+    }
+
+    fn update_matches(
+        &mut self,
+        _: String,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<picker::Picker<Self>>,
+    ) -> gpui::Task<()> {
+        gpui::Task::ready(())
+    }
+
+    fn confirm(
+        &mut self,
+        _: bool,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<picker::Picker<Self>>,
+    ) {
+    }
+
+    fn dismissed(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<picker::Picker<Self>>) {}
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<picker::Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let item = self.items.get(ix)?;
+        Some(ui::ListItem::new(ix).toggle_state(selected).child(*item))
+    }
+}
+
+fn set_picker_mode(cx: &mut VimTestContext, picker_mode: settings::PickerModeContent) {
+    cx.update_global(|store: &mut SettingsStore, cx| {
+        store.update_user_settings(cx, |s| {
+            s.vim.get_or_insert_default().picker_mode = Some(picker_mode);
+        });
+    });
+}
+
+fn open_test_picker(cx: &mut VimTestContext) {
+    cx.workspace(|workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |window, cx| {
+            picker::Picker::uniform_list(
+                TestPickerDelegate {
+                    items: vec!["one", "two", "three", "four"],
+                    selected_index: 0,
+                },
+                window,
+                cx,
+            )
+        });
+    });
+    cx.run_until_parked();
+}
+
+fn test_picker(
+    cx: &mut VimTestContext,
+) -> Option<gpui::Entity<picker::Picker<TestPickerDelegate>>> {
+    cx.workspace(|workspace, _, cx| {
+        workspace.active_modal::<picker::Picker<TestPickerDelegate>>(cx)
+    })
+}
+
+fn test_picker_state(cx: &mut VimTestContext) -> (usize, String) {
+    let picker = test_picker(cx).expect("picker should be open");
+    cx.update(|_, cx| {
+        let picker = picker.read(cx);
+        (picker.delegate.selected_index, picker.query(cx))
+    })
+}
+
+fn focused_vim_mode(cx: &mut VimTestContext) -> Option<Mode> {
+    cx.update(|_, cx| {
+        let vim = Vim::globals(cx).focused_vim()?;
+        Some(vim.read(cx).mode)
+    })
+}
+
+#[gpui::test]
+async fn test_picker_vim_mode_normal(cx: &mut gpui::TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    set_picker_mode(&mut cx, settings::PickerModeContent::Normal);
+    cx.set_state("aˇbc\n", Mode::Normal);
+
+    open_test_picker(&mut cx);
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Normal));
+
+    cx.simulate_keystrokes("j j");
+    assert_eq!(test_picker_state(&mut cx), (2, String::new()));
+    cx.simulate_keystrokes("k");
+    assert_eq!(test_picker_state(&mut cx), (1, String::new()));
+    cx.simulate_keystrokes("shift-g");
+    assert_eq!(test_picker_state(&mut cx), (3, String::new()));
+    cx.simulate_keystrokes("g g");
+    assert_eq!(test_picker_state(&mut cx), (0, String::new()));
+
+    cx.simulate_keystrokes("i j k");
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Insert));
+    assert_eq!(test_picker_state(&mut cx).1, "jk");
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Normal));
+    assert!(test_picker(&mut cx).is_some());
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(test_picker(&mut cx).is_none());
+    cx.assert_state("aˇbc\n", Mode::Normal);
+}
+
+#[gpui::test]
+async fn test_picker_vim_mode_insert(cx: &mut gpui::TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    set_picker_mode(&mut cx, settings::PickerModeContent::Insert);
+
+    open_test_picker(&mut cx);
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Insert));
+
+    cx.simulate_keystrokes("j escape j");
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Normal));
+    assert_eq!(test_picker_state(&mut cx), (1, "j".to_string()));
+}
+
+#[gpui::test]
+async fn test_picker_vim_mode_disabled(cx: &mut gpui::TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.set_state("aˇbc\n", Mode::Normal);
+
+    open_test_picker(&mut cx);
+    cx.simulate_keystrokes("j k");
+    assert_eq!(test_picker_state(&mut cx), (0, "jk".to_string()));
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(test_picker(&mut cx).is_none());
+}
+
+#[gpui::test]
+async fn test_command_line_opens_in_insert_mode(cx: &mut gpui::TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    set_picker_mode(&mut cx, settings::PickerModeContent::Normal);
+    cx.set_state("aˇbc\n", Mode::Normal);
+
+    cx.simulate_keystrokes(":");
+    cx.run_until_parked();
+    assert!(
+        cx.workspace(|workspace, _, cx| workspace.active_modal::<CommandPalette>(cx).is_some())
+    );
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Insert));
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Normal));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.workspace(|workspace, _, cx| workspace.active_modal::<CommandPalette>(cx).is_some())
+    );
+
+    // Opening the palette directly follows `vim.picker_mode`.
+    cx.simulate_keystrokes("cmd-shift-p");
+    cx.run_until_parked();
+    assert_eq!(focused_vim_mode(&mut cx), Some(Mode::Normal));
 }

@@ -2857,6 +2857,10 @@
     // When enabled, edit predictions are shown in Vim normal mode.
     // By default, edit predictions are only shown in insert and replace modes.
     "show_edit_predictions_in_normal_mode": false,
+    // Whether picker query editors (e.g. the file finder) use Vim mode, and which
+    // mode they open in. In normal mode, `escape` closes the picker.
+    // One of "disabled", "normal" or "insert".
+    "picker_mode": "disabled",
     // Cursor shape for each mode.
     // The shape can be one of the following: "block", "bar", "underline", "hollow".
     "cursor_shape": {

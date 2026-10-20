@@ -233,9 +233,26 @@ actions!(
         /// Executes a shell command.
         ShellCommand,
         /// Indicates that an argument is required for the command.
-        ArgumentRequired
+        ArgumentRequired,
+        /// Opens the command palette as Vim's command line, starting in insert mode.
+        ToggleCommandLine,
     ]
 );
+
+/// Opens the command palette like Vim's command line, which starts in insert
+/// mode even when `vim.picker_mode` opens pickers in normal mode.
+pub(crate) fn toggle_command_line(
+    workspace: &mut Workspace,
+    query: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    Vim::globals(cx).picker_mode_override = Some(Mode::Insert);
+    command_palette::CommandPalette::toggle(workspace, query, window, cx);
+    // Vim attaches to the palette's query editor when its creation effect is
+    // flushed, which happens before this deferred callback runs.
+    cx.defer(|cx| Vim::globals(cx).picker_mode_override = None);
+}
 
 /// Opens the specified file for editing.
 #[derive(Clone, PartialEq, Action)]
@@ -324,7 +341,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             return;
         };
         workspace.update(cx, |workspace, cx| {
-            command_palette::CommandPalette::toggle(workspace, "'<,'>", window, cx);
+            toggle_command_line(workspace, "'<,'>", window, cx);
         })
     });
 
@@ -333,7 +350,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             return;
         };
         workspace.update(cx, |workspace, cx| {
-            command_palette::CommandPalette::toggle(workspace, "'<,'>!", window, cx);
+            toggle_command_line(workspace, "'<,'>!", window, cx);
         })
     });
 
@@ -857,7 +874,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             ".".to_string()
         };
         workspace.update(cx, |workspace, cx| {
-            command_palette::CommandPalette::toggle(workspace, &n, window, cx);
+            toggle_command_line(workspace, &n, window, cx);
         })
     });
 
@@ -2386,7 +2403,7 @@ impl Vim {
         });
         if let Some(command) = command {
             workspace.update(cx, |workspace, cx| {
-                command_palette::CommandPalette::toggle(workspace, &command, window, cx);
+                toggle_command_line(workspace, &command, window, cx);
             });
         }
     }
@@ -2425,7 +2442,7 @@ impl Vim {
         });
         if let Some(command) = command {
             workspace.update(cx, |workspace, cx| {
-                command_palette::CommandPalette::toggle(workspace, &command, window, cx);
+                toggle_command_line(workspace, &command, window, cx);
             });
         }
     }

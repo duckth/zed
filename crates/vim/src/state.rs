@@ -284,6 +284,8 @@ pub struct VimGlobals {
     pub recordings: HashMap<char, Vec<ReplayableAction>>,
 
     pub focused_vim: Option<WeakEntity<Vim>>,
+    /// Overrides `vim.picker_mode` for the picker query editor that is being created.
+    pub picker_mode_override: Option<Mode>,
 
     pub marks: HashMap<EntityId, Entity<MarksState>>,
 }

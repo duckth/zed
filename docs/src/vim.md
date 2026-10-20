@@ -600,6 +600,9 @@ You can change the following settings to modify vim mode's behavior:
 | toggle_relative_line_numbers | If `true`, line numbers are relative in normal mode and absolute in insert mode, giving you the best of both options.                                                                         | false         |
 | custom_digraphs              | An object that allows you to add custom digraphs. Read below for an example.                                                                                                                  | {}            |
 | highlight_on_yank_duration   | The duration of the highlight animation(in ms). Set to `0` to disable                                                                                                                         | 200           |
+| picker_mode                  | Whether picker query editors (file finder, command palette, etc.) use vim mode, and which mode they open in. One of "disabled", "normal", "insert". See below.                             | "disabled"    |
+
+With `picker_mode` set to `"normal"` or `"insert"`, normal mode in a picker uses `j`/`k` to move through results, `g g`/`shift-g` to jump to the first/last result, `enter` to confirm and `escape` to close the picker. `i`, `a` and the other insert commands edit the query, and `escape` returns to normal mode. The command palette opened with `:` always starts in insert mode, like Vim's command line.
 
 Here's an example of adding a digraph for the zombie emoji. This allows you to type `ctrl-k f z` to insert a zombie emoji. You can add as many digraphs as you like.
 
