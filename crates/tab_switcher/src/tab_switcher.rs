@@ -1,3 +1,4 @@
+pub mod tab_finder;
 #[cfg(test)]
 mod tab_switcher_tests;
 
@@ -74,6 +75,7 @@ impl ModalView for TabSwitcher {}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(TabSwitcher::register).detach();
+    tab_finder::init(cx);
 }
 
 impl TabSwitcher {
@@ -279,69 +281,78 @@ impl TabMatch {
         window: &Window,
         cx: &App,
     ) -> Option<DecoratedIcon> {
-        let icon = self.item.tab_icon(window, cx)?;
-        let item_settings = ItemSettings::get_global(cx);
-        let show_diagnostics = item_settings.show_diagnostics;
-        let git_status_color = item_settings
-            .git_status
-            .then(|| {
-                let path = self.item.project_path(cx)?;
-                let project = project.read(cx);
-                let entry = project.entry_for_path(&path, cx)?;
-                let git_status = project
-                    .git_store()
-                    .read(cx)
-                    .display_status_for_project_path(&path, cx)
-                    .map(|status| status.summary())
-                    .unwrap_or_default();
-                Some(entry_git_aware_label_color(
-                    git_status,
-                    entry.is_ignored,
-                    selected,
-                ))
-            })
-            .flatten();
-        let colored_icon = icon.color(git_status_color.unwrap_or_default());
-
-        let most_severe_diagnostic_level = if show_diagnostics == ShowDiagnostics::Off {
-            None
-        } else {
-            let buffer_store = project.read(cx).buffer_store().read(cx);
-            let buffer = self
-                .item
-                .project_path(cx)
-                .and_then(|path| buffer_store.get_by_path(&path))
-                .map(|buffer| buffer.read(cx));
-            buffer.and_then(|buffer| {
-                buffer
-                    .buffer_diagnostics(None)
-                    .iter()
-                    .map(|diagnostic_entry| diagnostic_entry.diagnostic.severity)
-                    .min()
-            })
-        };
-
-        let decorations =
-            entry_diagnostic_aware_icon_decoration_and_color(most_severe_diagnostic_level)
-                .filter(|(d, _)| {
-                    *d != IconDecorationKind::Triangle
-                        || show_diagnostics != ShowDiagnostics::Errors
-                })
-                .map(|(icon, color)| {
-                    let knockout_item_color = if selected {
-                        cx.theme().colors().element_selected
-                    } else {
-                        cx.theme().colors().element_background
-                    };
-                    IconDecoration::new(icon, knockout_item_color, cx)
-                        .color(color.color(cx))
-                        .position(Point {
-                            x: px(-2.),
-                            y: px(-2.),
-                        })
-                });
-        Some(DecoratedIcon::new(colored_icon, decorations))
+        tab_icon(self.item.as_ref(), project, selected, window, cx)
     }
+}
+
+/// The item's tab icon, colored by git status and decorated with its most severe diagnostic.
+pub(crate) fn tab_icon(
+    item: &dyn ItemHandle,
+    project: &Entity<Project>,
+    selected: bool,
+    window: &Window,
+    cx: &App,
+) -> Option<DecoratedIcon> {
+    let icon = item.tab_icon(window, cx)?;
+    let item_settings = ItemSettings::get_global(cx);
+    let show_diagnostics = item_settings.show_diagnostics;
+    let git_status_color = item_settings
+        .git_status
+        .then(|| {
+            let path = item.project_path(cx)?;
+            let project = project.read(cx);
+            let entry = project.entry_for_path(&path, cx)?;
+            let git_status = project
+                .git_store()
+                .read(cx)
+                .display_status_for_project_path(&path, cx)
+                .map(|status| status.summary())
+                .unwrap_or_default();
+            Some(entry_git_aware_label_color(
+                git_status,
+                entry.is_ignored,
+                selected,
+            ))
+        })
+        .flatten();
+    let colored_icon = icon.color(git_status_color.unwrap_or_default());
+
+    let most_severe_diagnostic_level = if show_diagnostics == ShowDiagnostics::Off {
+        None
+    } else {
+        let buffer_store = project.read(cx).buffer_store().read(cx);
+        let buffer = item
+            .project_path(cx)
+            .and_then(|path| buffer_store.get_by_path(&path))
+            .map(|buffer| buffer.read(cx));
+        buffer.and_then(|buffer| {
+            buffer
+                .buffer_diagnostics(None)
+                .iter()
+                .map(|diagnostic_entry| diagnostic_entry.diagnostic.severity)
+                .min()
+        })
+    };
+
+    let decorations =
+        entry_diagnostic_aware_icon_decoration_and_color(most_severe_diagnostic_level)
+            .filter(|(d, _)| {
+                *d != IconDecorationKind::Triangle || show_diagnostics != ShowDiagnostics::Errors
+            })
+            .map(|(icon, color)| {
+                let knockout_item_color = if selected {
+                    cx.theme().colors().element_selected
+                } else {
+                    cx.theme().colors().element_background
+                };
+                IconDecoration::new(icon, knockout_item_color, cx)
+                    .color(color.color(cx))
+                    .position(Point {
+                        x: px(-2.),
+                        y: px(-2.),
+                    })
+            });
+    Some(DecoratedIcon::new(colored_icon, decorations))
 }
 
 impl TabSwitcherDelegate {
@@ -688,25 +699,39 @@ impl TabSwitcherDelegate {
             return;
         };
 
-        if let Some(index) = current_pane
-            .read(cx)
-            .index_for_item(selected_match.item.as_ref())
-        {
-            current_pane.update(cx, |pane, cx| {
-                pane.activate_item(index, true, true, window, cx);
-            });
-        } else if selected_match.item.project_path(cx).is_some()
-            && selected_match.item.can_split(cx)
-        {
-            let Some(workspace) = self.workspace.upgrade() else {
-                return;
-            };
-            let database_id = workspace.read(cx).database_id();
-            let task = selected_match.item.clone_on_split(database_id, window, cx);
-            let current_pane = current_pane.downgrade();
-            cx.spawn_in(window, async move |_, cx| {
+        show_item_in_pane(
+            &workspace,
+            &current_pane,
+            &selected_match.pane,
+            selected_match.item.as_ref(),
+            window,
+            cx,
+        );
+    }
+}
+
+/// Shows `item` in `target_pane`: activates it if the pane already has it, opens a copy there
+/// if it's a file that can be split, and otherwise moves it over from `source_pane`.
+pub(crate) fn show_item_in_pane(
+    workspace: &Entity<Workspace>,
+    target_pane: &Entity<Pane>,
+    source_pane: &WeakEntity<Pane>,
+    item: &dyn ItemHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(index) = target_pane.read(cx).index_for_item(item) {
+        target_pane.update(cx, |pane, cx| {
+            pane.activate_item(index, true, true, window, cx);
+        });
+    } else if item.project_path(cx).is_some() && item.can_split(cx) {
+        let database_id = workspace.read(cx).database_id();
+        let task = item.clone_on_split(database_id, window, cx);
+        let target_pane = target_pane.downgrade();
+        window
+            .spawn(cx, async move |cx| {
                 if let Some(clone) = task.await {
-                    current_pane
+                    target_pane
                         .update_in(cx, |pane, window, cx| {
                             pane.add_item(clone, true, true, None, window, cx);
                         })
@@ -714,20 +739,19 @@ impl TabSwitcherDelegate {
                 }
             })
             .detach();
-        } else {
-            let Some(source_pane) = selected_match.pane.upgrade() else {
-                return;
-            };
-            workspace::move_item(
-                &source_pane,
-                &current_pane,
-                selected_match.item.item_id(),
-                current_pane.read(cx).items_len(),
-                true,
-                window,
-                cx,
-            );
-        }
+    } else {
+        let Some(source_pane) = source_pane.upgrade() else {
+            return;
+        };
+        workspace::move_item(
+            &source_pane,
+            target_pane,
+            item.item_id(),
+            target_pane.read(cx).items_len(),
+            true,
+            window,
+            cx,
+        );
     }
 }
 

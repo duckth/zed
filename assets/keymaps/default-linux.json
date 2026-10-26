@@ -1308,6 +1308,12 @@
     },
   },
   {
+    "context": "TabFinder",
+    "bindings": {
+      "ctrl-backspace": "tab_switcher::CloseSelectedItem",
+    },
+  },
+  {
     "context": "StashList || (StashList > Picker > Editor)",
     "bindings": {
       "ctrl-shift-backspace": "stash_picker::DropStashItem",

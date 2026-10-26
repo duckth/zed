@@ -1364,6 +1364,13 @@
     },
   },
   {
+    "context": "TabFinder",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-backspace": "tab_switcher::CloseSelectedItem",
+    },
+  },
+  {
     "context": "StashList || (StashList > Picker > Editor)",
     "use_key_equivalents": true,
     "bindings": {
