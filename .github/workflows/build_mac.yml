@@ -1,0 +1,44 @@
+# Builds Zed Dev.app on GitHub's free macOS runner, so the fork doesn't need to be built locally.
+# Run it from the Actions tab or with `gh workflow run build_mac.yml -R duckth/zed`.
+name: Build Zed for Mac
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-mac-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bundle_mac_aarch64:
+    if: github.repository_owner == 'duckth'
+    runs-on: macos-15
+    timeout-minutes: 340
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # A first build can hit the timeout; saving anyway lets the next run pick up where it stopped.
+          cache-on-failure: true
+
+      - name: Bundle
+        # Without the signing secrets, the script ad-hoc signs the app instead of notarizing it.
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Zed-aarch64.dmg
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 7
