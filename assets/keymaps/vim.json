@@ -1346,4 +1346,15 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    // Oil.nvim-style keys inside the file browser. Kept last so they win over the
+    // vim motions bound to the same keys.
+    "context": "Editor && FileBrowser && vim_mode == normal",
+    "bindings": {
+      "enter": "file_browser::OpenEntry",
+      "-": "file_browser::GoToParent",
+      "_": "file_browser::GoToRoot",
+      "g .": "file_browser::ToggleHidden",
+    },
+  },
 ]
