@@ -15,7 +15,8 @@ permissions:
 jobs:
   bundle_mac_aarch64:
     if: github.repository_owner == 'duckth'
-    runs-on: macos-15
+    # bundle-mac requires the macOS 26 SDK, which is the default Xcode on this image.
+    runs-on: macos-26
     timeout-minutes: 340
     env:
       CARGO_INCREMENTAL: 0
