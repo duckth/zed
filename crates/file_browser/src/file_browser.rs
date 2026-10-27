@@ -1,15 +1,18 @@
 use std::{any::Any, any::TypeId, sync::Arc};
 
 use editor::{
-    Addon, Editor, SelectionEffects, display_map::HighlightKey, items::entry_git_aware_label_color,
-    scroll::Autoscroll,
+    Addon, Editor, Inlay, SelectionEffects, display_map::HighlightKey,
+    items::entry_git_aware_label_color, scroll::Autoscroll,
 };
+use file_icons::FileIcons;
 use gpui::{
     AnyEntity, App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
     KeyContext, ParentElement, Render, Styled, Subscription, TaskExt, WeakEntity, Window, actions,
 };
 use language::{Buffer, Point};
-use project::{Entry, Project, ProjectEntryId, ProjectPath, WorktreeId, git_store::GitStoreEvent};
+use project::{
+    Entry, InlayId, Project, ProjectEntryId, ProjectPath, WorktreeId, git_store::GitStoreEvent,
+};
 use ui::prelude::*;
 use util::rel_path::RelPath;
 use workspace::{
@@ -54,6 +57,8 @@ pub struct FileBrowser {
     entries: Vec<BrowserEntry>,
     show_hidden: bool,
     highlight_group_count: usize,
+    icon_inlay_ids: Vec<InlayId>,
+    next_icon_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -173,6 +178,9 @@ impl FileBrowser {
             }
         });
 
+        let theme_subscription =
+            cx.observe_global::<theme::GlobalTheme>(|this, cx| this.update_icons(cx));
+
         let mut browser = Self {
             editor,
             buffer,
@@ -183,7 +191,9 @@ impl FileBrowser {
             entries: Vec::new(),
             show_hidden: false,
             highlight_group_count: 0,
-            _subscriptions: vec![project_subscription, git_subscription],
+            icon_inlay_ids: Vec::new(),
+            next_icon_inlay_id: 0,
+            _subscriptions: vec![project_subscription, git_subscription, theme_subscription],
         };
         browser.load_directory(window, cx);
         let cursor_target = selected_name.map_or(CursorTarget::First, CursorTarget::Name);
@@ -271,6 +281,7 @@ impl FileBrowser {
                 .join("\n");
             self.buffer
                 .update(cx, |buffer, cx| buffer.set_text(text, cx));
+            self.update_icons(cx);
         }
 
         let row = target_name
@@ -361,6 +372,41 @@ impl FileBrowser {
                     .collect();
                 editor.highlight_text(HighlightKey::FileBrowser(group_index), ranges, style, cx);
             }
+        });
+    }
+
+    /// Icons are inlays rather than buffer text, so that motions, search and the name under the
+    /// cursor only ever see the entry names.
+    fn update_icons(&mut self, cx: &mut Context<Self>) {
+        let icon_paths = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let path = entry.path.as_std_path();
+                if entry.is_dir {
+                    FileIcons::get_folder_icon(false, path, cx)
+                } else {
+                    FileIcons::get_icon(path, cx)
+                }
+            })
+            .collect::<Vec<_>>();
+        let first_inlay_id = self.next_icon_inlay_id;
+        self.next_icon_inlay_id += icon_paths.len();
+        let previous_inlay_ids = std::mem::take(&mut self.icon_inlay_ids);
+        self.icon_inlay_ids = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let inlays = icon_paths
+                .into_iter()
+                .enumerate()
+                .filter_map(|(row, icon_path)| {
+                    // Anchoring before the line start keeps the cursor after the icon.
+                    let position = snapshot.anchor_before(Point::new(row as u32, 0));
+                    Some(Inlay::icon(first_inlay_id + row, position, icon_path?))
+                })
+                .collect::<Vec<_>>();
+            let inlay_ids = inlays.iter().map(|inlay| inlay.id).collect();
+            editor.splice_inlays(&previous_inlay_ids, inlays, cx);
+            inlay_ids
         });
     }
 
@@ -635,6 +681,43 @@ mod tests {
             0,
             cx,
         );
+    }
+
+    #[gpui::test]
+    async fn test_shows_an_icon_before_each_entry(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx).await;
+        open_file("src/main.rs", &workspace, cx).await;
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+
+        let display_text = |browser: &Entity<FileBrowser>, cx: &mut VisualTestContext| {
+            browser.update(cx, |browser, cx| {
+                browser
+                    .editor
+                    .update(cx, |editor, cx| editor.display_text(cx))
+            })
+        };
+        assert_eq!(display_text(&browser, cx), "▫lib.rs\n▫main.rs");
+        let cursor_column = browser.update(cx, |browser, cx| {
+            browser.editor.update(cx, |editor, cx| {
+                let display_snapshot = editor.display_snapshot(cx);
+                editor
+                    .selections
+                    .newest_display(&display_snapshot)
+                    .head()
+                    .column()
+            })
+        });
+        assert_eq!(
+            cursor_column as usize,
+            "▫".len(),
+            "the cursor should be after the icon"
+        );
+
+        cx.dispatch_action(GoToParent);
+        assert_listing(&browser, &["docs/", "src/", "A.txt", "b.txt"], 1, cx);
+        assert_eq!(display_text(&browser, cx), "▫docs/\n▫src/\n▫A.txt\n▫b.txt");
     }
 
     #[gpui::test]

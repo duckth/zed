@@ -512,6 +512,7 @@ pub enum InlayId {
     // LSP
     Hint(usize),
     Color(usize),
+    Icon(usize),
 }
 
 impl InlayId {
@@ -522,6 +523,7 @@ impl InlayId {
             Self::Hint(id) => *id,
             Self::Color(id) => *id,
             Self::ReplResult(id) => *id,
+            Self::Icon(id) => *id,
         }
     }
 }
