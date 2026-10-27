@@ -1357,4 +1357,12 @@
       "g .": "file_browser::ToggleHidden",
     },
   },
+  {
+    "context": "FileBrowserModal > Editor && VimControl && vim_mode == normal",
+    "bindings": {
+      "escape": "menu::Cancel",
+      "ctrl-c": "menu::Cancel",
+      "q": "menu::Cancel",
+    },
+  },
 ]

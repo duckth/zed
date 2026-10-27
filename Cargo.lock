@@ -6276,6 +6276,7 @@ dependencies = [
  "file_icons",
  "gpui",
  "language",
+ "menu",
  "project",
  "serde_json",
  "settings",

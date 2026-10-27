@@ -6,8 +6,9 @@ use editor::{
 };
 use file_icons::FileIcons;
 use gpui::{
-    AnyEntity, App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    KeyContext, ParentElement, Render, Styled, Subscription, TaskExt, WeakEntity, Window, actions,
+    AnyEntity, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    HighlightStyle, KeyContext, ParentElement, Render, Styled, Subscription, TaskExt, WeakEntity,
+    Window, actions,
 };
 use language::{Buffer, Point};
 use project::{
@@ -16,7 +17,7 @@ use project::{
 use ui::prelude::*;
 use util::rel_path::RelPath;
 use workspace::{
-    SaveIntent, Workspace,
+    ModalView, SaveIntent, Workspace,
     item::{Item, ItemEvent},
 };
 
@@ -25,6 +26,8 @@ actions!(
     [
         /// Opens the file browser at the directory of the active file, or at the project root.
         Open,
+        /// Opens the file browser in a floating window, or closes it if it's already open.
+        ToggleFloating,
         /// Opens the file or directory under the cursor in the file browser.
         OpenEntry,
         /// Shows the parent directory in the file browser.
@@ -41,6 +44,9 @@ pub fn init(cx: &mut App) {
         |workspace: &mut Workspace, _window, _: &mut Context<Workspace>| {
             workspace.register_action(|workspace, _: &Open, window, cx| {
                 FileBrowser::open(workspace, window, cx);
+            });
+            workspace.register_action(|workspace, _: &ToggleFloating, window, cx| {
+                FileBrowserModal::toggle(workspace, window, cx);
             });
         },
     )
@@ -105,55 +111,67 @@ impl Addon for FileBrowserAddon {
 
 pub enum Event {
     DirectoryChanged,
+    OpenedFile,
+}
+
+/// Where a new browser starts.
+struct Location {
+    worktree_id: WorktreeId,
+    directory: Arc<RelPath>,
+    selected_name: Option<String>,
+}
+
+impl Location {
+    /// The directory of the active file with that file selected, or else the project root.
+    fn initial(workspace: &Workspace, cx: &App) -> Option<Self> {
+        let active_path = workspace
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx));
+        match active_path {
+            Some(active_path) => Some(Self {
+                worktree_id: active_path.worktree_id,
+                directory: active_path
+                    .path
+                    .parent()
+                    .map_or_else(RelPath::empty_arc, Into::into),
+                selected_name: active_path.path.file_name().map(str::to_string),
+            }),
+            None => {
+                let worktree = workspace.project().read(cx).visible_worktrees(cx).next()?;
+                Some(Self {
+                    worktree_id: worktree.read(cx).id(),
+                    directory: RelPath::empty_arc(),
+                    selected_name: None,
+                })
+            }
+        }
+    }
 }
 
 impl FileBrowser {
     fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-        let project = workspace.project().clone();
-        let active_path = workspace
-            .active_item(cx)
-            .and_then(|item| item.project_path(cx));
-        let (worktree_id, directory, selected_name) = match active_path {
-            Some(active_path) => (
-                active_path.worktree_id,
-                active_path
-                    .path
-                    .parent()
-                    .map_or_else(RelPath::empty_arc, Into::into),
-                active_path.path.file_name().map(str::to_string),
-            ),
-            None => {
-                let Some(worktree) = project.read(cx).visible_worktrees(cx).next() else {
-                    return;
-                };
-                (worktree.read(cx).id(), RelPath::empty_arc(), None)
-            }
+        let Some(location) = Location::initial(workspace, cx) else {
+            return;
         };
-
+        let project = workspace.project().clone();
         let workspace_handle = workspace.weak_handle();
-        let browser = cx.new(|cx| {
-            FileBrowser::new(
-                project,
-                workspace_handle,
-                worktree_id,
-                directory,
-                selected_name,
-                window,
-                cx,
-            )
-        });
+        let browser =
+            cx.new(|cx| FileBrowser::new(project, workspace_handle, location, window, cx));
         workspace.add_item_to_active_pane(Box::new(browser), None, true, window, cx);
     }
 
     fn new(
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
-        worktree_id: WorktreeId,
-        directory: Arc<RelPath>,
-        selected_name: Option<String>,
+        location: Location,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let Location {
+            worktree_id,
+            directory,
+            selected_name,
+        } = location;
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let editor = cx.new(|cx| {
             let mut editor = Editor::for_buffer(buffer.clone(), None, window, cx);
@@ -440,13 +458,25 @@ impl FileBrowser {
             path: entry.path,
         };
         let browser = cx.entity();
-        let pane = workspace
-            .read(cx)
-            .pane_for(&browser)
+        let browser_pane = workspace.read(cx).pane_for(&browser);
+        let target_pane = browser_pane
+            .clone()
             .unwrap_or_else(|| workspace.read(cx).active_pane().clone());
         let open_task = workspace.update(cx, |workspace, cx| {
-            workspace.open_path(project_path, Some(pane.downgrade()), true, window, cx)
+            workspace.open_path(
+                project_path,
+                Some(target_pane.downgrade()),
+                true,
+                window,
+                cx,
+            )
         });
+        let Some(pane) = browser_pane else {
+            // A floating browser isn't in a pane; its modal closes itself on this event.
+            cx.emit(Event::OpenedFile);
+            open_task.detach_and_log_err(cx);
+            return;
+        };
         // Like Oil, the file takes the browser's place instead of opening next to it.
         let browser_id = browser.entity_id();
         cx.spawn_in(window, async move |_, cx| {
@@ -537,6 +567,7 @@ impl Item for FileBrowser {
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         match event {
             Event::DirectoryChanged => f(ItemEvent::UpdateTab),
+            Event::OpenedFile => {}
         }
     }
 
@@ -553,6 +584,79 @@ impl Item for FileBrowser {
         } else {
             None
         }
+    }
+}
+
+pub struct FileBrowserModal {
+    browser: Entity<FileBrowser>,
+    _subscription: Subscription,
+}
+
+impl FileBrowserModal {
+    fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+        let Some(location) = Location::initial(workspace, cx) else {
+            return;
+        };
+        let project = workspace.project().clone();
+        let workspace_handle = workspace.weak_handle();
+        workspace.toggle_modal(window, cx, |window, cx| {
+            let browser =
+                cx.new(|cx| FileBrowser::new(project, workspace_handle, location, window, cx));
+            let subscription = cx.subscribe(&browser, |_, _, event: &Event, cx| match event {
+                // The modal shows the directory in its header.
+                Event::DirectoryChanged => cx.notify(),
+                Event::OpenedFile => cx.emit(DismissEvent),
+            });
+            Self {
+                browser,
+                _subscription: subscription,
+            }
+        });
+    }
+
+    fn dismiss(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for FileBrowserModal {}
+
+impl ModalView for FileBrowserModal {}
+
+impl Focusable for FileBrowserModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.browser.focus_handle(cx)
+    }
+}
+
+impl Render for FileBrowserModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport_size = window.viewport_size();
+        let title = self.browser.read(cx).title(cx);
+        v_flex()
+            .key_context("FileBrowserModal")
+            .on_action(cx.listener(Self::dismiss))
+            .w(rems(40.))
+            .max_w(viewport_size.width * 0.9)
+            .h(viewport_size.height * 0.6)
+            .elevation_3(cx)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(div().flex_1().min_h_0().child(self.browser.clone()))
     }
 }
 
@@ -749,9 +853,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_vim_keys(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx).await;
+    fn enable_vim(cx: &mut VisualTestContext) {
         cx.update(|_, cx| {
             vim::init(cx);
             cx.update_global::<settings::SettingsStore, _>(|store, cx| {
@@ -773,6 +875,12 @@ mod tests {
                 cx.bind_keys(bindings);
             }
         });
+    }
+
+    #[gpui::test]
+    async fn test_vim_keys(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx).await;
+        enable_vim(cx);
         open_file("src/main.rs", &workspace, cx).await;
         cx.dispatch_action(Open);
         cx.run_until_parked();
@@ -833,5 +941,72 @@ mod tests {
             4,
             cx,
         );
+    }
+
+    fn floating_browser(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Entity<FileBrowser>> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_modal::<FileBrowserModal>(cx)
+                .map(|modal| modal.read(cx).browser.clone())
+        })
+    }
+
+    #[gpui::test]
+    async fn test_floating_browser(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx).await;
+        enable_vim(cx);
+        open_file("src/main.rs", &workspace, cx).await;
+
+        cx.dispatch_action(ToggleFloating);
+        cx.run_until_parked();
+        let browser = floating_browser(&workspace, cx).expect("the browser should be floating");
+        assert_listing(&browser, &["lib.rs", "main.rs"], 1, cx);
+
+        cx.simulate_keystrokes("-");
+        assert_listing(&browser, &["docs/", "src/", "A.txt", "b.txt"], 1, cx);
+        cx.simulate_keystrokes("q");
+        assert!(
+            floating_browser(&workspace, cx).is_none(),
+            "q should close it"
+        );
+
+        cx.dispatch_action(ToggleFloating);
+        cx.run_until_parked();
+        assert!(floating_browser(&workspace, cx).is_some());
+        cx.simulate_keystrokes("escape");
+        assert!(
+            floating_browser(&workspace, cx).is_none(),
+            "escape should close it"
+        );
+
+        cx.dispatch_action(ToggleFloating);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("k enter");
+        cx.run_until_parked();
+        assert!(
+            floating_browser(&workspace, cx).is_none(),
+            "opening a file should close it"
+        );
+        workspace.read_with(cx, |workspace, cx| {
+            let pane = workspace.active_pane().read(cx);
+            assert_eq!(pane.items_len(), 2);
+            let editor = workspace
+                .active_item_as::<Editor>(cx)
+                .expect("lib.rs should be open");
+            assert_eq!(editor.read(cx).title(cx), "lib.rs");
+        });
+        cx.update(|window, cx| {
+            let editor = workspace
+                .read(cx)
+                .active_item_as::<Editor>(cx)
+                .expect("lib.rs should be open");
+            assert!(
+                editor.focus_handle(cx).is_focused(window),
+                "the opened file should have focus"
+            );
+        });
     }
 }
