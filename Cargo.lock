@@ -6272,6 +6272,8 @@ dependencies = [
 name = "file_browser"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "collections",
  "command_palette",
  "editor",
  "file_icons",
@@ -6281,6 +6283,7 @@ dependencies = [
  "project",
  "serde_json",
  "settings",
+ "similar",
  "theme",
  "theme_settings",
  "ui",

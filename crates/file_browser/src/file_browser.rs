@@ -1,4 +1,10 @@
-use std::{any::Any, any::TypeId, sync::Arc};
+mod changes;
+
+use std::{any::Any, any::TypeId, path::Path, sync::Arc};
+
+use anyhow::{Context as _, Result, anyhow};
+use changes::{Change, plan_changes};
+use collections::HashMap;
 
 use editor::{
     Addon, Editor, Inlay, SelectionEffects, display_map::HighlightKey,
@@ -6,11 +12,11 @@ use editor::{
 };
 use file_icons::FileIcons;
 use gpui::{
-    AnyEntity, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, KeyContext, ParentElement, Render, Styled, Subscription, TaskExt, WeakEntity,
-    Window, actions,
+    AnyEntity, App, AsyncWindowContext, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, HighlightStyle, KeyContext, ParentElement, PromptLevel, Render, Styled,
+    Subscription, Task, TaskExt, WeakEntity, Window, actions,
 };
-use language::{Buffer, Point};
+use language::{Buffer, BufferEvent, Point};
 use project::{
     Entry, InlayId, Project, ProjectEntryId, ProjectPath, WorktreeId, git_store::GitStoreEvent,
 };
@@ -18,7 +24,8 @@ use ui::prelude::*;
 use util::rel_path::RelPath;
 use workspace::{
     ModalView, SaveIntent, Workspace,
-    item::{Item, ItemEvent},
+    item::{Item, ItemEvent, SaveOptions},
+    notifications::DetachAndPromptErr,
 };
 
 actions!(
@@ -60,7 +67,11 @@ pub struct FileBrowser {
     workspace: WeakEntity<Workspace>,
     worktree_id: WorktreeId,
     directory: Arc<RelPath>,
+    /// The entries as listed in the buffer before any unsaved edits.
     entries: Vec<BrowserEntry>,
+    listing_text: String,
+    /// Whether edits to the listing can be saved to the file system.
+    editable: bool,
     show_hidden: bool,
     highlight_group_count: usize,
     icon_inlay_ids: Vec<InlayId>,
@@ -88,7 +99,7 @@ impl BrowserEntry {
 }
 
 enum CursorTarget {
-    /// Keep the cursor on the entry it's on, e.g. when the directory's contents change.
+    /// Keep the cursor on the name it's on, e.g. when the directory's contents change.
     Keep,
     /// Put the cursor on the entry with this name, falling back to the first entry.
     Name(String),
@@ -111,7 +122,16 @@ impl Addon for FileBrowserAddon {
 
 pub enum Event {
     DirectoryChanged,
+    Edited,
     OpenedFile,
+}
+
+/// What became of unsaved edits after asking the user about them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Resolution {
+    Applied,
+    Discarded,
+    Cancelled,
 }
 
 /// Where a new browser starts.
@@ -156,7 +176,7 @@ impl FileBrowser {
         let project = workspace.project().clone();
         let workspace_handle = workspace.weak_handle();
         let browser =
-            cx.new(|cx| FileBrowser::new(project, workspace_handle, location, window, cx));
+            cx.new(|cx| FileBrowser::new(project, workspace_handle, location, true, window, cx));
         workspace.add_item_to_active_pane(Box::new(browser), None, true, window, cx);
     }
 
@@ -164,6 +184,7 @@ impl FileBrowser {
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         location: Location,
+        editable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -175,11 +196,17 @@ impl FileBrowser {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let editor = cx.new(|cx| {
             let mut editor = Editor::for_buffer(buffer.clone(), None, window, cx);
-            editor.set_read_only(true);
+            editor.set_read_only(!editable);
             editor.register_addon(FileBrowserAddon);
             editor
         });
 
+        let buffer_subscription = cx.subscribe(&buffer, |this, _, event: &BufferEvent, cx| {
+            if matches!(event, BufferEvent::Edited { .. }) {
+                this.update_decorations(cx);
+                cx.emit(Event::Edited);
+            }
+        });
         let project_subscription =
             cx.subscribe_in(&project, window, |this, _, event, window, cx| match event {
                 project::Event::WorktreeUpdatedEntries(worktree_id, _)
@@ -192,12 +219,11 @@ impl FileBrowser {
         let git_store = project.read(cx).git_store().clone();
         let git_subscription = cx.subscribe(&git_store, |this, _, event: &GitStoreEvent, cx| {
             if matches!(event, GitStoreEvent::RepositoryUpdated(..)) {
-                this.update_highlights(cx);
+                this.update_decorations(cx);
             }
         });
-
         let theme_subscription =
-            cx.observe_global::<theme::GlobalTheme>(|this, cx| this.update_icons(cx));
+            cx.observe_global::<theme::GlobalTheme>(|this, cx| this.update_decorations(cx));
 
         let mut browser = Self {
             editor,
@@ -207,11 +233,18 @@ impl FileBrowser {
             worktree_id,
             directory,
             entries: Vec::new(),
+            listing_text: String::new(),
+            editable,
             show_hidden: false,
             highlight_group_count: 0,
             icon_inlay_ids: Vec::new(),
             next_icon_inlay_id: 0,
-            _subscriptions: vec![project_subscription, git_subscription, theme_subscription],
+            _subscriptions: vec![
+                buffer_subscription,
+                project_subscription,
+                git_subscription,
+                theme_subscription,
+            ],
         };
         browser.load_directory(window, cx);
         let cursor_target = selected_name.map_or(CursorTarget::First, CursorTarget::Name);
@@ -271,20 +304,21 @@ impl FileBrowser {
         }
     }
 
+    /// Lists the directory again, unless there are unsaved edits, which would be lost.
     fn refresh(
         &mut self,
         cursor_target: CursorTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_unsaved_edits(cx) {
+            return;
+        }
         let entries = self.read_entries(cx);
         // When the entry under the cursor disappears (e.g. it was deleted), the cursor stays on
         // the same row rather than jumping to the top.
         let (target_name, fallback_row) = match cursor_target {
-            CursorTarget::Keep => (
-                self.entry_under_cursor(cx).map(|entry| entry.name.clone()),
-                self.cursor_row(cx),
-            ),
+            CursorTarget::Keep => (self.name_under_cursor(cx), self.cursor_row(cx)),
             CursorTarget::Name(name) => (Some(name), 0),
             CursorTarget::First => (None, 0),
         };
@@ -297,14 +331,19 @@ impl FileBrowser {
                 .map(BrowserEntry::line)
                 .collect::<Vec<_>>()
                 .join("\n");
-            self.buffer
-                .update(cx, |buffer, cx| buffer.set_text(text, cx));
-            self.update_icons(cx);
+            self.listing_text = text.clone();
+            self.set_text_without_undo(text, cx);
         }
 
         let row = target_name
             .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
-            .unwrap_or_else(|| fallback_row.min(self.entries.len().saturating_sub(1)));
+            .unwrap_or(fallback_row);
+        self.select_row(row, window, cx);
+        self.update_decorations(cx);
+    }
+
+    fn select_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let row = row.min(self.entries.len().saturating_sub(1));
         let cursor = Point::new(row as u32, 0);
         self.editor.update(cx, |editor, cx| {
             editor.change_selections(
@@ -314,7 +353,25 @@ impl FileBrowser {
                 |selections| selections.select_ranges([cursor..cursor]),
             );
         });
-        self.update_highlights(cx);
+    }
+
+    /// Replaces the buffer's text and clears its undo history, so that undo can't bring back the
+    /// listing of another directory, or edits that were already applied or discarded.
+    fn set_text_without_undo(&mut self, text: String, cx: &mut Context<Self>) {
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.set_text(text, cx);
+            while let Some(transaction_id) = buffer
+                .peek_undo_stack()
+                .or_else(|| buffer.peek_redo_stack())
+                .map(|entry| entry.transaction_id())
+            {
+                buffer.forget_transaction(transaction_id);
+            }
+        });
+    }
+
+    fn has_unsaved_edits(&self, cx: &App) -> bool {
+        self.editable && self.buffer.read(cx).text() != self.listing_text
     }
 
     fn cursor_row(&self, cx: &mut App) -> usize {
@@ -328,37 +385,71 @@ impl FileBrowser {
         })
     }
 
+    fn name_under_cursor(&self, cx: &mut App) -> Option<String> {
+        let row = self.cursor_row(cx);
+        let text = self.buffer.read(cx).text();
+        let line = text.lines().nth(row)?.trim().trim_end_matches('/');
+        (!line.is_empty()).then(|| line.to_string())
+    }
+
     fn entry_under_cursor(&self, cx: &mut App) -> Option<&BrowserEntry> {
         let row = self.cursor_row(cx);
         self.entries.get(row)
     }
 
-    fn update_highlights(&mut self, cx: &mut Context<Self>) {
+    /// Colors and icons follow the text rather than the listed entries, so that they stay on the
+    /// right lines while the listing is edited.
+    fn update_decorations(&mut self, cx: &mut Context<Self>) {
+        let text = self.buffer.read(cx).text();
+        let entries_by_line = self
+            .entries
+            .iter()
+            .map(|entry| (entry.line(), entry))
+            .collect::<HashMap<_, _>>();
         let git_store = self.project.read(cx).git_store().read(cx);
+
+        let mut icon_paths = Vec::new();
         let mut groups: Vec<(Color, Vec<(usize, usize)>)> = Vec::new();
-        for (row, entry) in self.entries.iter().enumerate() {
-            let project_path = ProjectPath {
-                worktree_id: self.worktree_id,
-                path: entry.path.clone(),
+        for (row, line) in text.lines().enumerate() {
+            let name = line.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let entry = entries_by_line.get(name);
+            let is_dir = entry.map_or_else(|| name.ends_with('/'), |entry| entry.is_dir);
+            let path = Path::new(name.trim_end_matches('/'));
+            let icon_path = if is_dir {
+                FileIcons::get_folder_icon(false, path, cx)
+            } else {
+                FileIcons::get_icon(path, cx)
             };
-            let git_status = git_store
-                .display_status_for_project_path(&project_path, cx)
-                .map(|status| status.summary())
-                .unwrap_or_default();
-            let mut color = entry_git_aware_label_color(git_status, entry.is_ignored, false);
-            if color == Color::Default && entry.is_dir {
+            if let Some(icon_path) = icon_path {
+                icon_paths.push((row, icon_path));
+            }
+
+            let mut color = entry.map_or(Color::Default, |entry| {
+                let project_path = ProjectPath {
+                    worktree_id: self.worktree_id,
+                    path: entry.path.clone(),
+                };
+                let git_status = git_store
+                    .display_status_for_project_path(&project_path, cx)
+                    .map(|status| status.summary())
+                    .unwrap_or_default();
+                entry_git_aware_label_color(git_status, entry.is_ignored, false)
+            });
+            if color == Color::Default && is_dir {
                 color = Color::Accent;
             }
             if color == Color::Default {
                 continue;
             }
-            let line_len = entry.line().len();
             match groups
                 .iter_mut()
                 .find(|(group_color, _)| *group_color == color)
             {
-                Some((_, rows)) => rows.push((row, line_len)),
-                None => groups.push((color, vec![(row, line_len)])),
+                Some((_, rows)) => rows.push((row, line.len())),
+                None => groups.push((color, vec![(row, line.len())])),
             }
         }
 
@@ -374,7 +465,10 @@ impl FileBrowser {
             .collect::<Vec<_>>();
         let previous_group_count = self.highlight_group_count;
         self.highlight_group_count = styled_groups.len();
-        self.editor.update(cx, |editor, cx| {
+        let first_inlay_id = self.next_icon_inlay_id;
+        self.next_icon_inlay_id += icon_paths.len();
+        let previous_inlay_ids = std::mem::take(&mut self.icon_inlay_ids);
+        self.icon_inlay_ids = self.editor.update(cx, |editor, cx| {
             for group_index in 0..previous_group_count {
                 editor.clear_highlights(HighlightKey::FileBrowser(group_index), cx);
             }
@@ -390,42 +484,159 @@ impl FileBrowser {
                     .collect();
                 editor.highlight_text(HighlightKey::FileBrowser(group_index), ranges, style, cx);
             }
-        });
-    }
 
-    /// Icons are inlays rather than buffer text, so that motions, search and the name under the
-    /// cursor only ever see the entry names.
-    fn update_icons(&mut self, cx: &mut Context<Self>) {
-        let icon_paths = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let path = entry.path.as_std_path();
-                if entry.is_dir {
-                    FileIcons::get_folder_icon(false, path, cx)
-                } else {
-                    FileIcons::get_icon(path, cx)
-                }
-            })
-            .collect::<Vec<_>>();
-        let first_inlay_id = self.next_icon_inlay_id;
-        self.next_icon_inlay_id += icon_paths.len();
-        let previous_inlay_ids = std::mem::take(&mut self.icon_inlay_ids);
-        self.icon_inlay_ids = self.editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            // Icons are inlays rather than buffer text, so that motions, search and edits only
+            // ever see the names. Anchoring before the line start keeps the cursor after the icon.
             let inlays = icon_paths
                 .into_iter()
                 .enumerate()
-                .filter_map(|(row, icon_path)| {
-                    // Anchoring before the line start keeps the cursor after the icon.
+                .map(|(index, (row, icon_path))| {
                     let position = snapshot.anchor_before(Point::new(row as u32, 0));
-                    Some(Inlay::icon(first_inlay_id + row, position, icon_path?))
+                    Inlay::icon(first_inlay_id + index, position, icon_path)
                 })
                 .collect::<Vec<_>>();
             let inlay_ids = inlays.iter().map(|inlay| inlay.id).collect();
             editor.splice_inlays(&previous_inlay_ids, inlays, cx);
             inlay_ids
         });
+    }
+
+    fn plan_changes(&self, cx: &App) -> Result<Vec<Change>> {
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(self.worktree_id, cx)
+            .map(|worktree| worktree.read(cx).snapshot());
+        plan_changes(
+            &self.directory,
+            &self.entries,
+            &self.buffer.read(cx).text(),
+            |path| {
+                worktree
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.entry_for_path(path).is_some())
+            },
+        )
+    }
+
+    /// Asks whether to apply the unsaved edits to the file system, listing the changes that
+    /// would be made, and applies them if so. When `can_discard` is set, the edits can also be
+    /// thrown away instead.
+    fn resolve_edits(
+        &mut self,
+        can_discard: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Resolution>> {
+        if !self.has_unsaved_edits(cx) {
+            return Task::ready(Ok(Resolution::Applied));
+        }
+        let plan = self.plan_changes(cx);
+        if let Ok(changes) = &plan
+            && changes.is_empty()
+        {
+            // Only blank lines or whitespace changed.
+            self.listing_text = self.buffer.read(cx).text();
+            self.refresh(CursorTarget::Keep, window, cx);
+            cx.emit(Event::Edited);
+            return Task::ready(Ok(Resolution::Applied));
+        }
+
+        const APPLY: &str = "Apply";
+        const DISCARD: &str = "Discard";
+        const CANCEL: &str = "Cancel";
+        let (level, message, detail, answers) = match &plan {
+            Ok(changes) => {
+                let level = if changes.iter().any(Change::is_trash) {
+                    PromptLevel::Warning
+                } else {
+                    PromptLevel::Info
+                };
+                let message = if can_discard {
+                    "Apply your changes before leaving this directory?".to_string()
+                } else if changes.len() == 1 {
+                    "Apply this change?".to_string()
+                } else {
+                    format!("Apply these {} changes?", changes.len())
+                };
+                let detail = changes
+                    .iter()
+                    .map(Change::description)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let answers = if can_discard {
+                    vec![APPLY, DISCARD, CANCEL]
+                } else {
+                    vec![APPLY, CANCEL]
+                };
+                (level, message, detail, answers)
+            }
+            Err(error) => {
+                let answers = if can_discard {
+                    vec![DISCARD, CANCEL]
+                } else {
+                    vec![CANCEL]
+                };
+                (
+                    PromptLevel::Critical,
+                    "Your changes can't be applied".to_string(),
+                    error.to_string(),
+                    answers,
+                )
+            }
+        };
+        let prompt = window.prompt(level, &message, Some(&detail), &answers, cx);
+        let project = self.project.clone();
+        let worktree_id = self.worktree_id;
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answers.get(prompt.await?).copied();
+            match (answer, plan) {
+                (Some(APPLY), Ok(changes)) => {
+                    let result = apply_changes(&project, worktree_id, changes, cx).await;
+                    // Even when a change failed, the ones before it were made, so the listing
+                    // is reloaded to show what's actually on disk.
+                    this.update_in(cx, |this, window, cx| {
+                        this.listing_text = this.buffer.read(cx).text();
+                        this.entries.clear();
+                        this.refresh(CursorTarget::Keep, window, cx);
+                        cx.emit(Event::Edited);
+                    })?;
+                    result?;
+                    Ok(Resolution::Applied)
+                }
+                (Some(DISCARD), _) => {
+                    this.update_in(cx, |this, window, cx| {
+                        let row = this.cursor_row(cx);
+                        let listing_text = this.listing_text.clone();
+                        this.set_text_without_undo(listing_text, cx);
+                        this.select_row(row, window, cx);
+                    })?;
+                    Ok(Resolution::Discarded)
+                }
+                _ => Ok(Resolution::Cancelled),
+            }
+        })
+    }
+
+    /// Runs `action` once there are no unsaved edits, asking what to do with any first.
+    fn after_resolving_edits(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if !self.has_unsaved_edits(cx) {
+            action(self, window, cx);
+            return;
+        }
+        let resolve = self.resolve_edits(true, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if resolve.await? != Resolution::Cancelled {
+                this.update_in(cx, |this, window, cx| action(this, window, cx))?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to apply changes", window, cx, |_, _, _| None);
     }
 
     fn navigate_to(
@@ -442,6 +653,10 @@ impl FileBrowser {
     }
 
     fn open_entry(&mut self, _: &OpenEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.after_resolving_edits(window, cx, Self::open_entry_under_cursor);
+    }
+
+    fn open_entry_under_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entry_under_cursor(cx).cloned() else {
             return;
         };
@@ -490,21 +705,27 @@ impl FileBrowser {
     }
 
     fn go_to_parent(&mut self, _: &GoToParent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(parent) = self.directory.parent() else {
-            return;
-        };
-        let current_name = self.directory.file_name().map(str::to_string);
-        let cursor_target = current_name.map_or(CursorTarget::First, CursorTarget::Name);
-        self.navigate_to(parent.into(), cursor_target, window, cx);
+        self.after_resolving_edits(window, cx, |this, window, cx| {
+            let Some(parent) = this.directory.parent() else {
+                return;
+            };
+            let current_name = this.directory.file_name().map(str::to_string);
+            let cursor_target = current_name.map_or(CursorTarget::First, CursorTarget::Name);
+            this.navigate_to(parent.into(), cursor_target, window, cx);
+        });
     }
 
     fn go_to_root(&mut self, _: &GoToRoot, window: &mut Window, cx: &mut Context<Self>) {
-        self.navigate_to(RelPath::empty_arc(), CursorTarget::First, window, cx);
+        self.after_resolving_edits(window, cx, |this, window, cx| {
+            this.navigate_to(RelPath::empty_arc(), CursorTarget::First, window, cx);
+        });
     }
 
     fn toggle_hidden(&mut self, _: &ToggleHidden, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_hidden = !self.show_hidden;
-        self.refresh(CursorTarget::Keep, window, cx);
+        self.after_resolving_edits(window, cx, |this, window, cx| {
+            this.show_hidden = !this.show_hidden;
+            this.refresh(CursorTarget::Keep, window, cx);
+        });
     }
 
     fn title(&self, cx: &App) -> String {
@@ -531,6 +752,51 @@ impl FileBrowser {
             )
         }
     }
+}
+
+async fn apply_changes(
+    project: &Entity<Project>,
+    worktree_id: WorktreeId,
+    changes: Vec<Change>,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    for change in changes {
+        let result = match &change {
+            Change::CreateDirectory { path } | Change::CreateFile { path } => {
+                let is_directory = matches!(change, Change::CreateDirectory { .. });
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: path.clone(),
+                };
+                project
+                    .update(cx, |project, cx| {
+                        project.create_entry(project_path, is_directory, cx)
+                    })
+                    .await
+                    .map(drop)
+            }
+            Change::Rename { entry_id, to, .. } => {
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: to.clone(),
+                };
+                project
+                    .update(cx, |project, cx| {
+                        project.rename_entry(*entry_id, project_path, cx)
+                    })
+                    .await
+                    .map(drop)
+            }
+            Change::Trash { entry_id, .. } => {
+                match project.update(cx, |project, cx| project.trash_entry(*entry_id, cx)) {
+                    Some(task) => task.await.map(drop),
+                    None => Err(anyhow!("it no longer exists")),
+                }
+            }
+        };
+        result.with_context(|| format!("Couldn't apply: {}", change.description()))?;
+    }
+    Ok(())
 }
 
 impl EventEmitter<Event> for FileBrowser {}
@@ -564,9 +830,48 @@ impl Item for FileBrowser {
         Some(Icon::new(IconName::Folder))
     }
 
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Vim's `:w` saves through the workspace the editor belongs to.
+        self.editor.update(cx, |editor, cx| {
+            editor.added_to_workspace(workspace, window, cx)
+        });
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.has_unsaved_edits(cx)
+    }
+
+    fn can_save(&self, _: &App) -> bool {
+        self.editable
+    }
+
+    fn save(
+        &mut self,
+        options: SaveOptions,
+        _: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        // Changes to the file system are only made when asked for explicitly.
+        if options.autosave {
+            return Task::ready(Ok(()));
+        }
+        let resolve = self.resolve_edits(false, window, cx);
+        cx.background_spawn(async move { resolve.await.map(|_| ()) })
+    }
+
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         match event {
             Event::DirectoryChanged => f(ItemEvent::UpdateTab),
+            Event::Edited => {
+                f(ItemEvent::Edit);
+                f(ItemEvent::UpdateTab);
+            }
             Event::OpenedFile => {}
         }
     }
@@ -600,11 +905,14 @@ impl FileBrowserModal {
         let project = workspace.project().clone();
         let workspace_handle = workspace.weak_handle();
         workspace.toggle_modal(window, cx, |window, cx| {
-            let browser =
-                cx.new(|cx| FileBrowser::new(project, workspace_handle, location, window, cx));
+            // Saving from a modal isn't possible: `:` would close it, and there is no tab to show
+            // unsaved changes on.
+            let browser = cx
+                .new(|cx| FileBrowser::new(project, workspace_handle, location, false, window, cx));
             let subscription = cx.subscribe(&browser, |_, _, event: &Event, cx| match event {
                 // The modal shows the directory in its header.
                 Event::DirectoryChanged => cx.notify(),
+                Event::Edited => {}
                 Event::OpenedFile => cx.emit(DismissEvent),
             });
             Self {
@@ -873,6 +1181,9 @@ mod tests {
         cx.update(|cx| {
             command_palette::init(cx);
             vim::init(cx);
+        });
+        // Vim only notices the setting change (and e.g. handles `:w`) once it's observing settings.
+        cx.update(|cx| {
             cx.update_global::<settings::SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| settings.vim_mode = Some(true));
             });
@@ -1029,5 +1340,161 @@ mod tests {
                 "the opened file should have focus"
             );
         });
+    }
+
+    fn set_listing_text(browser: &Entity<FileBrowser>, text: &str, cx: &mut VisualTestContext) {
+        browser.update_in(cx, |browser, window, cx| {
+            browser
+                .editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        });
+    }
+
+    fn is_dirty(browser: &Entity<FileBrowser>, cx: &mut VisualTestContext) -> bool {
+        browser.read_with(cx, |browser, cx| browser.is_dirty(cx))
+    }
+
+    fn project_paths(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+        let fs = workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone());
+        let mut paths = fs
+            .as_fake()
+            .paths(false)
+            .into_iter()
+            .filter_map(|path| {
+                let path = path.strip_prefix(path!("/root")).ok()?;
+                let path = path.to_str()?.replace('\\', "/");
+                (!path.is_empty()).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[gpui::test]
+    async fn test_saving_applies_edits(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx).await;
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+
+        set_listing_text(&browser, "documents/\nsrc/\nA.txt\nnew/file.txt\n", cx);
+        assert!(is_dirty(&browser, cx));
+        let save = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_active_item(SaveIntent::Save, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Apply these 3 changes?".to_string(),
+                "Create new/\nRename docs → documents\nRename b.txt → new/file.txt".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Apply");
+        save.await.expect("saving failed");
+        cx.run_until_parked();
+
+        assert!(!is_dirty(&browser, cx));
+        // The cursor was on the last line, and stays on that row.
+        assert_listing(&browser, &["documents/", "new/", "src/", "A.txt"], 3, cx);
+        assert_eq!(
+            project_paths(&workspace, cx),
+            [
+                ".hidden",
+                "A.txt",
+                "documents",
+                "new",
+                "new/file.txt",
+                "src",
+                "src/lib.rs",
+                "src/main.rs",
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_a_save_keeps_the_edits(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx).await;
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+
+        set_listing_text(&browser, "docs/\nsrc/\nA.txt\nc.txt", cx);
+        let save = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_active_item(SaveIntent::Save, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        save.await.expect("saving failed");
+        assert!(is_dirty(&browser, cx));
+        assert!(project_paths(&workspace, cx).contains(&"b.txt".to_string()));
+    }
+
+    #[gpui::test]
+    async fn test_leaving_a_directory_with_edits_asks_first(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx).await;
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+        let edited_text = "docs/\nsrc/\nA.txt\nc.txt";
+        set_listing_text(&browser, edited_text, cx);
+        browser.update_in(cx, |browser, window, cx| browser.select_row(1, window, cx));
+
+        cx.dispatch_action(OpenEntry);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Apply your changes before leaving this directory?".to_string(),
+                "Rename b.txt → c.txt".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        browser.read_with(cx, |browser, cx| {
+            assert_eq!(browser.title(cx), "root/");
+            assert_eq!(browser.buffer.read(cx).text(), edited_text);
+        });
+
+        cx.dispatch_action(OpenEntry);
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        assert!(!is_dirty(&browser, cx));
+        assert_listing(&browser, &["lib.rs", "main.rs"], 0, cx);
+        assert!(project_paths(&workspace, cx).contains(&"b.txt".to_string()));
+    }
+
+    #[gpui::test]
+    async fn test_editing_with_vim(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_vim(cx).await;
+        open_file("b.txt", &workspace, cx).await;
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+        assert_listing(&browser, &["docs/", "src/", "A.txt", "b.txt"], 3, cx);
+
+        cx.simulate_keystrokes("d d : w");
+        // The command palette matches commands in the background.
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.pending_prompt(),
+            Some(("Apply this change?".to_string(), "Trash b.txt".to_string()))
+        );
+        cx.simulate_prompt_answer("Apply");
+        cx.run_until_parked();
+        assert_listing(&browser, &["docs/", "src/", "A.txt"], 2, cx);
+        assert!(!project_paths(&workspace, cx).contains(&"b.txt".to_string()));
+
+        // Undo can't bring back a listing that no longer matches the file system.
+        cx.simulate_keystrokes("- u");
+        assert!(!is_dirty(&browser, cx));
+        cx.simulate_keystrokes("k enter");
+        assert_listing(&browser, &["lib.rs", "main.rs"], 0, cx);
+        cx.simulate_keystrokes("u");
+        assert!(!is_dirty(&browser, cx));
+        assert_listing(&browser, &["lib.rs", "main.rs"], 0, cx);
     }
 }
