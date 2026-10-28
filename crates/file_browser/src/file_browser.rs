@@ -680,6 +680,22 @@ mod tests {
 
     async fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         let app_state = init_test(cx);
+        build_workspace(app_state, cx).await
+    }
+
+    async fn setup_with_vim(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let app_state = init_test(cx);
+        // Vim registers some of its actions (e.g. `:`) on workspaces as they're created.
+        enable_vim(cx);
+        build_workspace(app_state, cx).await
+    }
+
+    async fn build_workspace(
+        app_state: Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
         app_state
             .fs
             .as_fake()
@@ -853,8 +869,9 @@ mod tests {
         });
     }
 
-    fn enable_vim(cx: &mut VisualTestContext) {
-        cx.update(|_, cx| {
+    fn enable_vim(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            command_palette::init(cx);
             vim::init(cx);
             cx.update_global::<settings::SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| settings.vim_mode = Some(true));
@@ -879,8 +896,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_vim_keys(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx).await;
-        enable_vim(cx);
+        let (workspace, cx) = setup_with_vim(cx).await;
         open_file("src/main.rs", &workspace, cx).await;
         cx.dispatch_action(Open);
         cx.run_until_parked();
@@ -956,8 +972,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_floating_browser(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx).await;
-        enable_vim(cx);
+        let (workspace, cx) = setup_with_vim(cx).await;
         open_file("src/main.rs", &workspace, cx).await;
 
         cx.dispatch_action(ToggleFloating);
@@ -967,6 +982,12 @@ mod tests {
 
         cx.simulate_keystrokes("-");
         assert_listing(&browser, &["docs/", "src/", "A.txt", "b.txt"], 1, cx);
+        cx.simulate_keystrokes(": / n");
+        cx.run_until_parked();
+        assert!(
+            floating_browser(&workspace, cx).is_some(),
+            "the command line and search shouldn't replace the browser"
+        );
         cx.simulate_keystrokes("q");
         assert!(
             floating_browser(&workspace, cx).is_none(),

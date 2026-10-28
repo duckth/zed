@@ -1365,4 +1365,20 @@
       "q": "menu::Cancel",
     },
   },
+  {
+    "context": "FileBrowserModal > Editor && VimControl",
+    "bindings": {
+      // These rely on a pane or open another modal, so in the floating browser they would
+      // fail silently, act on the file behind it, or close it.
+      ":": null,
+      "/": null,
+      "?": null,
+      "#": null,
+      "*": null,
+      "n": null,
+      "shift-n": null,
+      "ctrl-o": null,
+      "ctrl-i": null,
+    },
+  },
 ]

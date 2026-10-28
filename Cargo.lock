@@ -6272,6 +6272,7 @@ dependencies = [
 name = "file_browser"
 version = "0.1.0"
 dependencies = [
+ "command_palette",
  "editor",
  "file_icons",
  "gpui",
