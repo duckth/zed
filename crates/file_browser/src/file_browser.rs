@@ -26,6 +26,7 @@ use workspace::{
     ModalView, SaveIntent, Workspace,
     item::{Item, ItemEvent, SaveOptions},
     notifications::DetachAndPromptErr,
+    searchable::SearchableItemHandle,
 };
 
 actions!(
@@ -846,6 +847,10 @@ impl Item for FileBrowser {
         self.has_unsaved_edits(cx)
     }
 
+    fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
+        Some(Box::new(self.editor.clone()))
+    }
+
     fn can_save(&self, _: &App) -> bool {
         self.editable
     }
@@ -1180,6 +1185,7 @@ mod tests {
     fn enable_vim(cx: &mut TestAppContext) {
         cx.update(|cx| {
             command_palette::init(cx);
+            search::init(cx);
             vim::init(cx);
         });
         // Vim only notices the setting change (and e.g. handles `:w`) once it's observing settings.
@@ -1496,5 +1502,28 @@ mod tests {
         cx.simulate_keystrokes("u");
         assert!(!is_dirty(&browser, cx));
         assert_listing(&browser, &["lib.rs", "main.rs"], 0, cx);
+    }
+
+    #[gpui::test]
+    async fn test_searching_with_vim(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_vim(cx).await;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.toolbar().update(cx, |toolbar, cx| {
+                    let search_bar = cx.new(|cx| search::BufferSearchBar::new(None, window, cx));
+                    toolbar.add_item(search_bar, window, cx);
+                });
+            });
+        });
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+        assert_listing(&browser, &["docs/", "src/", "A.txt", "b.txt"], 0, cx);
+
+        cx.simulate_keystrokes("/ b . t");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_listing(&browser, &["docs/", "src/", "A.txt", "b.txt"], 3, cx);
     }
 }

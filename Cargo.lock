@@ -6281,6 +6281,7 @@ dependencies = [
  "language",
  "menu",
  "project",
+ "search",
  "serde_json",
  "settings",
  "similar",

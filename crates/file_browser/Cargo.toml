@@ -31,6 +31,7 @@ workspace.workspace = true
 command_palette.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
+search.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 theme = { workspace = true, features = ["test-support"] }
