@@ -118,7 +118,7 @@ async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppContext) {
+async fn test_multi_workspace_keeps_workspaces_when_agent_is_disabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
@@ -149,9 +149,93 @@ async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppC
     multi_workspace.read_with(cx, |multi_workspace, cx| {
         assert!(!multi_workspace.multi_workspace_enabled(cx));
         assert!(!multi_workspace.sidebar_open());
-        assert_eq!(multi_workspace.workspaces().count(), 1);
-        assert!(multi_workspace.project_group_keys().is_empty());
+        assert_eq!(
+            multi_workspace.workspaces().count(),
+            2,
+            "disabling the agent should not close other workspaces"
+        );
     });
+}
+
+#[gpui::test]
+async fn test_switching_projects_with_ai_disabled_retains_workspaces(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+    });
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file_a.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file_b.txt": "" }))
+        .await;
+
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    cx.run_until_parked();
+
+    let workspace_a = window
+        .read_with(cx, |mw, cx| {
+            assert!(!mw.multi_workspace_enabled(cx));
+            mw.workspace().clone()
+        })
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    let dirty_item = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+    workspace_a.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(dirty_item.clone()), None, true, window, cx);
+    });
+
+    let open_task = window
+        .update(cx, |mw, window, cx| {
+            mw.open_project(
+                vec![PathBuf::from(path!("/project_b"))],
+                OpenMode::Activate,
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Checked before awaiting: an unanswered close prompt would block the task forever.
+    assert!(
+        !cx.has_pending_prompt(),
+        "switching projects should not ask to close the previous one"
+    );
+    let workspace_b = open_task.await.unwrap();
+    assert_ne!(workspace_b, workspace_a);
+    window
+        .read_with(cx, |mw, _cx| {
+            assert_eq!(mw.workspace(), &workspace_b);
+            assert!(mw.is_workspace_retained(&workspace_a));
+            assert!(mw.is_workspace_retained(&workspace_b));
+            assert!(!mw.sidebar_open());
+        })
+        .unwrap();
+    assert!(workspace_a.read_with(cx, |workspace, _cx| workspace.session_id().is_some()));
+
+    window
+        .update(cx, |mw, window, cx| {
+            mw.activate(workspace_a.clone(), None, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |mw, _cx| {
+            assert_eq!(mw.workspace(), &workspace_a);
+            assert_eq!(mw.workspaces().count(), 2);
+            assert!(mw.is_workspace_retained(&workspace_b));
+        })
+        .unwrap();
+    assert!(
+        workspace_a.read_with(cx, |workspace, cx| workspace
+            .items(cx)
+            .any(|item| item.is_dirty(cx))),
+        "the previous workspace's unsaved state should survive switching away and back"
+    );
 }
 
 #[gpui::test]
