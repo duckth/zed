@@ -1,6 +1,7 @@
 mod mappings;
 
 mod alacritty;
+mod program_status;
 mod pty_info;
 pub mod terminal_settings;
 
@@ -34,6 +35,8 @@ use theme::{ActiveTheme, Theme};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
+use program_status::PROGRAM_STATUS_QUERY_REPLY;
+pub use program_status::ProgramState;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::{
@@ -677,6 +680,9 @@ pub enum Event {
     SelectionsChanged,
     NewNavigationTarget(Option<MaybeNavigationTarget>),
     Open(MaybeNavigationTarget),
+    /// The state reported by the program running in the terminal changed; see
+    /// [`Terminal::program_state`].
+    ProgramStateChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -736,6 +742,8 @@ pub(crate) enum TerminalBackendEvent {
     Bell,
     Exit,
     ChildExit(ExitStatus),
+    ProgramStatusQuery,
+    ProgramStatus(Option<ProgramState>),
 }
 
 impl fmt::Debug for TerminalBackendEvent {
@@ -754,6 +762,8 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::Bell => f.write_str("Bell"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
+            Self::ProgramStatusQuery => f.write_str("ProgramStatusQuery"),
+            Self::ProgramStatus(state) => write!(f, "ProgramStatus({state:?})"),
         }
     }
 }
@@ -1047,6 +1057,7 @@ impl TerminalBuilder {
 
             selection_head: None,
             breadcrumb_text: String::new(),
+            program_state: None,
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -1334,6 +1345,7 @@ impl TerminalBuilder {
 
                 selection_head: None,
                 breadcrumb_text: String::new(),
+                program_state: None,
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1541,6 +1553,7 @@ pub struct Terminal {
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
+    program_state: Option<ProgramState>,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1722,6 +1735,15 @@ impl Terminal {
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
                 self.register_task_finished(Some(exit_status), cx);
+            }
+            TerminalBackendEvent::ProgramStatusQuery => {
+                self.write_to_pty(PROGRAM_STATUS_QUERY_REPLY);
+            }
+            TerminalBackendEvent::ProgramStatus(state) => {
+                if self.program_state != state {
+                    self.program_state = state;
+                    cx.emit(Event::ProgramStateChanged);
+                }
             }
         }
     }
@@ -3185,6 +3207,18 @@ impl Terminal {
         }
     }
 
+    /// The state last reported by the program running in the terminal via the OSC 7501 program
+    /// status protocol, if any.
+    pub fn program_state(&self) -> Option<ProgramState> {
+        self.program_state
+    }
+
+    /// Handles a program status report as if the program had written it to the PTY.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_program_state(&mut self, state: Option<ProgramState>, cx: &mut Context<Self>) {
+        self.process_event(TerminalBackendEvent::ProgramStatus(state), cx);
+    }
+
     pub fn task(&self) -> Option<&TaskState> {
         self.task.as_ref()
     }
@@ -4318,6 +4352,40 @@ mod tests {
             content_after.contains("from_injection"),
             "expected injected output to appear, got: {content_after}"
         );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_program_status_query_is_answered_and_state_reported(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        // Like Claude Code: query for support, wait for the reply, and only then report a state.
+        let script = r#"stty raw -echo
+printf '\033]7501;?\033\\'
+reply=$(dd bs=1 count=10 2>/dev/null)
+case "$reply" in
+  *"7501;?"*) printf 'got-reply\033]7501;state=blocked:app=test\033\\' ;;
+  *) printf 'no-reply' ;;
+esac"#;
+        let terminal = build_test_terminal_with_arguments(
+            cx,
+            "sh".to_string(),
+            vec!["-c".to_string(), script.to_string()],
+        )
+        .await;
+
+        assert_content_eventually(&terminal, "got-reply", cx).await;
+        let mut state = None;
+        for _ in 0..100 {
+            state = terminal.read_with(cx, |terminal, _| terminal.program_state());
+            if state.is_some() {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        assert_eq!(state, Some(ProgramState::Blocked));
     }
 
     #[cfg(unix)]

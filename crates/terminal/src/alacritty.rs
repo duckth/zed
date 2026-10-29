@@ -7,7 +7,7 @@ use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
 mod hyperlinks;
 
 use alacritty_terminal::{
-    event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
+    event::{Event as AlacTermEvent, EventListener, Notify, OnResize, WindowSize},
     event_loop::{EventLoop, Msg, Notifier},
     grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
@@ -21,7 +21,7 @@ use alacritty_terminal::{
         cell::{Cell as AlacCell, Flags, Hyperlink as AlacHyperlink},
         search::{Match, RegexIter, RegexSearch},
     },
-    tty,
+    tty::{self, ChildEvent, EventedPty, EventedReadWrite},
     vi_mode::{ViModeCursor, ViMotion as AlacViMotion},
     vte::ansi::{
         ClearMode, CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
@@ -30,6 +30,7 @@ use alacritty_terminal::{
 };
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
+use polling::{Event as PollEvent, PollMode, Poller};
 use util::paths::PathStyle;
 use vte::ansi::Handler;
 #[cfg(target_os = "windows")]
@@ -40,6 +41,7 @@ use crate::{
     HyperlinkData, IndexedCell, Modes, Point, PtyEvent, Range, RenderableCells, Scroll, Search,
     Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
     ViMotion,
+    program_status::{ProgramStatusScanner, ProgramStatusSequence},
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -217,6 +219,11 @@ pub(super) fn spawn_event_loop(
     pty: AlacrittyPty,
     drain_on_exit: bool,
 ) -> Result<PtySender> {
+    let pty = ProgramStatusPty {
+        pty,
+        scanner: ProgramStatusScanner::default(),
+        events_tx: events_tx.clone(),
+    };
     let event_loop = EventLoop::new(
         term,
         ZedListener {
@@ -234,6 +241,82 @@ pub(super) fn spawn_event_loop(
     Ok(PtySender {
         notifier: Notifier(pty_tx),
     })
+}
+
+/// Reports OSC 7501 program status sequences, which alacritty's parser discards, while passing
+/// the PTY output through unchanged.
+struct ProgramStatusPty {
+    pty: AlacrittyPty,
+    scanner: ProgramStatusScanner,
+    events_tx: UnboundedSender<PtyEvent>,
+}
+
+impl io::Read for ProgramStatusPty {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.pty.reader().read(buffer)?;
+        let events_tx = &self.events_tx;
+        self.scanner
+            .scan(buffer.get(..count).unwrap_or_default(), |sequence| {
+                let event = match sequence {
+                    ProgramStatusSequence::Query => TerminalBackendEvent::ProgramStatusQuery,
+                    ProgramStatusSequence::State(state) => {
+                        TerminalBackendEvent::ProgramStatus(state)
+                    }
+                };
+                // Sending only fails once the terminal is gone, like in `ZedListener`.
+                events_tx.unbounded_send(PtyEvent::Event(event, 0)).ok();
+            });
+        Ok(count)
+    }
+}
+
+impl EventedReadWrite for ProgramStatusPty {
+    type Reader = Self;
+    type Writer = <AlacrittyPty as EventedReadWrite>::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poller: &Arc<Poller>,
+        interest: PollEvent,
+        mode: PollMode,
+    ) -> io::Result<()> {
+        // SAFETY: The wrapped PTY owns the registered sources, and the caller upholds the
+        // same contract for it as for this wrapper.
+        unsafe { self.pty.register(poller, interest, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poller: &Arc<Poller>,
+        interest: PollEvent,
+        mode: PollMode,
+    ) -> io::Result<()> {
+        self.pty.reregister(poller, interest, mode)
+    }
+
+    fn deregister(&mut self, poller: &Arc<Poller>) -> io::Result<()> {
+        self.pty.deregister(poller)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.pty.writer()
+    }
+}
+
+impl EventedPty for ProgramStatusPty {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.pty.next_child_event()
+    }
+}
+
+impl OnResize for ProgramStatusPty {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.pty.on_resize(window_size);
+    }
 }
 
 pub(super) fn resize(term: &mut AlacrittyTerm, bounds: TerminalBounds) {

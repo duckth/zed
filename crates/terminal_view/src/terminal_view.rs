@@ -1276,6 +1276,9 @@ fn subscribe_for_terminal_events(
                     cx.emit(ItemEvent::UpdateTab);
                 }
 
+                // Program state is shown by the session switcher, which subscribes to it itself.
+                Event::ProgramStateChanged => {}
+
                 Event::NewNavigationTarget(maybe_navigation_target) => {
                     match maybe_navigation_target
                         .as_ref()

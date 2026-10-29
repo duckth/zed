@@ -203,6 +203,7 @@ pub struct SettingsContent {
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
     pub tab_switcher: Option<TabSwitcherSettingsContent>,
+    pub session_switcher: Option<SessionSwitcherSettingsContent>,
     pub status_bar: Option<StatusBarSettingsContent>,
 
     pub preview_tabs: Option<PreviewTabsSettingsContent>,
@@ -405,7 +406,7 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
+        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, session_switcher, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
@@ -1544,6 +1545,16 @@ pub struct TabSwitcherSettingsContent {
     ///
     /// Default: true
     pub show_file_preview: Option<bool>,
+}
+
+/// Settings for the session switcher.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct SessionSwitcherSettingsContent {
+    /// Whether to show the number of terminals needing attention in the status bar: programs
+    /// that are waiting on you, failed, or finished while you were elsewhere.
+    ///
+    /// Default: true
+    pub show_attention_count: Option<bool>,
 }
 
 /// Settings for configuring the which-key popup behaviour.

@@ -1,28 +1,50 @@
 #[cfg(test)]
 mod session_switcher_tests;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use collections::HashSet;
 use fuzzy_nucleo::StringMatchCandidate;
 use gpui::{
-    Action, AnyElement, AnyWindowHandle, App, Context, DismissEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Render, Task, TaskExt as _, WeakEntity, Window,
-    WindowHandle, actions, rems,
+    Action, AnyElement, AnyWindowHandle, App, AppContext as _, Context, DismissEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, Render, Subscription, Task,
+    TaskExt as _, WeakEntity, Window, WindowHandle, actions, rems,
 };
 use picker::{Picker, PickerDelegate};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use terminal::TaskStatus;
+use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
+use terminal::{ProgramState, TaskStatus};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::{ResultExt as _, paths::PathExt as _};
 use workspace::{
-    ModalView, MultiWorkspace, OpenMode, Pane, ProjectGroupKey, RecentWorkspace,
-    SerializedWorkspaceLocation, Workspace, WorkspaceDb, ZoomIn, dock::Panel as _, item::Item as _,
+    HideStatusItem, ItemHandle, ModalView, MultiWorkspace, OpenMode, Pane, ProjectGroupKey,
+    RecentWorkspace, SerializedWorkspaceLocation, StatusItemView, Workspace, WorkspaceDb, ZoomIn,
+    dock::Panel as _, item::Item as _,
 };
 
 const MODAL_WIDTH_REMS: f32 = 34.;
+
+#[derive(Clone, Copy, Debug, RegisterSetting)]
+pub struct SessionSwitcherSettings {
+    pub show_attention_count: bool,
+}
+
+impl Settings for SessionSwitcherSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        Self {
+            show_attention_count: content
+                .session_switcher
+                .as_ref()
+                .and_then(|session_switcher| session_switcher.show_attention_count)
+                .unwrap_or(true),
+        }
+    }
+}
 
 /// Opens the session switcher, listing open sessions with their editor and terminal views,
 /// followed by recent projects that are not open.
@@ -55,18 +77,30 @@ actions!(
         NextView,
         /// Activates the previous view (editor or terminal) of the current session.
         PreviousView,
+        /// Activates the next terminal, in any session, whose program needs attention: it is
+        /// waiting on you, failed, or finished while you were elsewhere.
+        JumpToNextAttention,
     ]
 );
 
 pub fn init(cx: &mut App) {
+    let attention_tracker = cx.new(|_| AttentionTracker::default());
+    cx.set_global(GlobalAttentionTracker(attention_tracker));
     cx.observe_new(register_actions).detach();
+    cx.observe_new(track_terminal_attention).detach();
 }
 
 fn register_actions(
     workspace: &mut Workspace,
-    _window: Option<&mut Window>,
-    _cx: &mut Context<Workspace>,
+    window: Option<&mut Window>,
+    cx: &mut Context<Workspace>,
 ) {
+    if let Some(window) = window {
+        let attention_indicator = cx.new(AttentionIndicator::new);
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_right_item(attention_indicator, window, cx);
+        });
+    }
     workspace.register_action(|workspace, action: &Toggle, window, cx| {
         let mode = if action.current_session_only {
             Mode::CurrentSession
@@ -98,6 +132,109 @@ fn register_actions(
             activate_view(workspace, view, window, cx);
         }
     });
+    workspace.register_action(|workspace, _: &JumpToNextAttention, window, cx| {
+        let views = session_views(workspace, cx);
+        let focused_terminal = match views.get(focused_view_index(&views, window, cx)) {
+            Some(SessionView::Terminal { terminal_view, .. }) => Some(terminal_view.entity_id()),
+            Some(SessionView::Editor) | None => None,
+        };
+        // Like `ToggleLastSession`, this reads every workspace, including this borrowed one.
+        cx.defer(move |cx| jump_to_next_attention(focused_terminal, cx));
+    });
+}
+
+/// Remembers terminals whose program reported `done` while they were not focused, so they keep
+/// needing attention until they are looked at. Notifies whenever any terminal's attention may
+/// have changed.
+#[derive(Default)]
+struct AttentionTracker {
+    unseen_done: HashSet<EntityId>,
+}
+
+struct GlobalAttentionTracker(Entity<AttentionTracker>);
+
+impl Global for GlobalAttentionTracker {}
+
+impl AttentionTracker {
+    fn global(cx: &App) -> Option<Entity<Self>> {
+        cx.try_global::<GlobalAttentionTracker>()
+            .map(|tracker| tracker.0.clone())
+    }
+}
+
+fn track_terminal_attention(
+    terminal_view: &mut TerminalView,
+    window: Option<&mut Window>,
+    cx: &mut Context<TerminalView>,
+) {
+    let (Some(window), Some(attention_tracker)) = (window, AttentionTracker::global(cx)) else {
+        return;
+    };
+    let terminal_view_id = cx.entity_id();
+
+    cx.subscribe_in(terminal_view.terminal(), window, {
+        let attention_tracker = attention_tracker.clone();
+        move |terminal_view, terminal, event, window, cx| {
+            if *event != terminal::Event::ProgramStateChanged {
+                return;
+            }
+            let unseen_done = terminal.read(cx).program_state() == Some(ProgramState::Done)
+                && !terminal_view.focus_handle(cx).contains_focused(window, cx);
+            attention_tracker.update(cx, |tracker, cx| {
+                if unseen_done {
+                    tracker.unseen_done.insert(terminal_view_id);
+                } else {
+                    tracker.unseen_done.remove(&terminal_view_id);
+                }
+                cx.notify();
+            });
+        }
+    })
+    .detach();
+
+    let focus_handle = terminal_view.focus_handle(cx);
+    cx.on_focus_in(&focus_handle, window, {
+        let attention_tracker = attention_tracker.clone();
+        move |_, _, cx| {
+            attention_tracker.update(cx, |tracker, cx| {
+                if tracker.unseen_done.remove(&terminal_view_id) {
+                    cx.notify();
+                }
+            });
+        }
+    })
+    .detach();
+
+    cx.on_release(move |_, cx| {
+        attention_tracker.update(cx, |tracker, cx| {
+            tracker.unseen_done.remove(&terminal_view_id);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+fn needs_attention(terminal_view: &Entity<TerminalView>, cx: &App) -> bool {
+    match terminal_view.read(cx).terminal().read(cx).program_state() {
+        Some(ProgramState::Blocked | ProgramState::Error) => true,
+        Some(ProgramState::Done) => AttentionTracker::global(cx).is_some_and(|tracker| {
+            tracker
+                .read(cx)
+                .unseen_done
+                .contains(&terminal_view.entity_id())
+        }),
+        Some(ProgramState::Working | ProgramState::Idle) | None => false,
+    }
+}
+
+fn attention_count(workspace: &Workspace, cx: &App) -> usize {
+    session_terminals(workspace, cx)
+        .iter()
+        .filter(|view| match view {
+            SessionView::Terminal { terminal_view, .. } => needs_attention(terminal_view, cx),
+            SessionView::Editor => false,
+        })
+        .count()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -302,6 +439,59 @@ fn sessions_by_recency(current_window: AnyWindowHandle, cx: &App) -> Vec<Session
     sessions
 }
 
+/// Terminals of all sessions in a stable order (windows, then sessions as held, then panel
+/// order), so that repeated jumps visit every terminal needing attention in turn. Must not be
+/// called while any of the workspaces is being updated.
+fn all_terminals(cx: &App) -> Vec<(Session, SessionView)> {
+    let mut terminals = Vec::new();
+    for window in cx.windows() {
+        let Some(window) = window.downcast::<MultiWorkspace>() else {
+            continue;
+        };
+        let Ok(multi_workspace) = window.read(cx) else {
+            continue;
+        };
+        for workspace in multi_workspace.workspaces() {
+            let session = Session {
+                window,
+                workspace: workspace.clone(),
+                is_current: false,
+            };
+            for view in session_terminals(workspace.read(cx), cx) {
+                terminals.push((session.clone(), view));
+            }
+        }
+    }
+    terminals
+}
+
+fn jump_to_next_attention(focused_terminal: Option<EntityId>, cx: &mut App) {
+    let terminals = all_terminals(cx);
+    let is_focused = |view: &SessionView| match view {
+        SessionView::Terminal { terminal_view, .. } => {
+            Some(terminal_view.entity_id()) == focused_terminal
+        }
+        SessionView::Editor => false,
+    };
+    let start = terminals
+        .iter()
+        .position(|(_, view)| is_focused(view))
+        .map_or(0, |index| index + 1);
+    let target = terminals
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(terminals.len())
+        .find(|(_, view)| {
+            !is_focused(view)
+                && matches!(view, SessionView::Terminal { terminal_view, .. } if needs_attention(terminal_view, cx))
+        })
+        .cloned();
+    if let Some((session, view)) = target {
+        activate_session(&session, Some(view), cx);
+    }
+}
+
 fn toggle_last_session(current_window: AnyWindowHandle, cx: &mut App) {
     let sessions = sessions_by_recency(current_window, cx);
     if let Some(session) = sessions.iter().find(|session| !session.is_current) {
@@ -370,6 +560,39 @@ fn view_title(view: &SessionView, cx: &App) -> SharedString {
     }
 }
 
+/// Like `view_title`, but without the working directory name that Zed prefixes to shell
+/// titles, since rows show the working directory next to the title already.
+fn compact_view_title(view: &SessionView, cx: &App) -> SharedString {
+    let SessionView::Terminal { terminal_view, .. } = view else {
+        return view_title(view, cx);
+    };
+    let terminal_view = terminal_view.read(cx);
+    let terminal = terminal_view.terminal().read(cx);
+    let has_custom_title = terminal_view
+        .custom_title()
+        .is_some_and(|title| !title.trim().is_empty());
+    if has_custom_title || terminal.task().is_some() {
+        return view_title(view, cx);
+    }
+    let title = terminal.title(false);
+    let working_directory = terminal.working_directory();
+    match strip_directory_prefix(&title, working_directory.as_deref()) {
+        Some(process) => process.to_string().into(),
+        None => view_title(view, cx),
+    }
+}
+
+/// `Terminal::title` composes shell titles as `<working directory name> — <process>`, with
+/// the directory taken from the same process info as `Terminal::working_directory`. Returns
+/// the process part when `title` has exactly that prefix.
+fn strip_directory_prefix<'a>(title: &'a str, working_directory: Option<&Path>) -> Option<&'a str> {
+    let directory_name = working_directory?.file_name()?.to_string_lossy();
+    title
+        .strip_prefix(directory_name.as_ref())?
+        .strip_prefix(" — ")
+        .filter(|process| !process.is_empty())
+}
+
 fn view_detail(session: &Session, view: &SessionView, cx: &App) -> Option<SharedString> {
     match view {
         SessionView::Editor => {
@@ -398,11 +621,23 @@ fn view_detail(session: &Session, view: &SessionView, cx: &App) -> Option<Shared
     }
 }
 
-fn render_terminal_status(terminal_view: &TerminalView, cx: &App) -> Option<AnyElement> {
-    let (icon, color, label) = if terminal_view.has_bell() {
+fn render_terminal_status(terminal_view: &Entity<TerminalView>, cx: &App) -> Option<AnyElement> {
+    let program_state = terminal_view.read(cx).terminal().read(cx).program_state();
+    let (icon, color, label) = if let Some(program_state) = program_state {
+        match program_state {
+            ProgramState::Working => (IconName::ArrowCircle, Color::Accent, "working"),
+            ProgramState::Blocked => (IconName::Warning, Color::Warning, "waiting"),
+            ProgramState::Done if needs_attention(terminal_view, cx) => {
+                (IconName::Check, Color::Success, "done")
+            }
+            ProgramState::Done => (IconName::Check, Color::Muted, "done"),
+            ProgramState::Idle => (IconName::Circle, Color::Muted, "idle"),
+            ProgramState::Error => (IconName::XCircle, Color::Error, "error"),
+        }
+    } else if terminal_view.read(cx).has_bell() {
         (IconName::Bell, Color::Warning, "bell")
     } else {
-        match terminal_view.terminal().read(cx).task()?.status {
+        match terminal_view.read(cx).terminal().read(cx).task()?.status {
             TaskStatus::Running => (IconName::PlayFilled, Color::Accent, "running"),
             TaskStatus::Completed { success: true } => (IconName::Check, Color::Success, "done"),
             TaskStatus::Completed { success: false } => (IconName::XCircle, Color::Error, "failed"),
@@ -416,6 +651,21 @@ fn render_terminal_status(terminal_view: &TerminalView, cx: &App) -> Option<AnyE
             .child(Label::new(label).color(color).size(LabelSize::Small))
             .into_any_element(),
     )
+}
+
+fn render_attention_count(count: usize) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .child(
+            Icon::new(IconName::Warning)
+                .color(Color::Warning)
+                .size(IconSize::Small),
+        )
+        .child(
+            Label::new(count.to_string())
+                .color(Color::Warning)
+                .size(LabelSize::Small),
+        )
 }
 
 fn row_label(title: SharedString, detail: Option<SharedString>) -> impl IntoElement {
@@ -437,6 +687,7 @@ fn row_label(title: SharedString, detail: Option<SharedString>) -> impl IntoElem
 pub struct SessionSwitcher {
     picker: Entity<Picker<SessionSwitcherDelegate>>,
     _load_recent_projects: Task<()>,
+    _observe_attention: Option<Subscription>,
 }
 
 impl SessionSwitcher {
@@ -498,9 +749,16 @@ impl SessionSwitcher {
                 })
             };
 
+            let observe_attention = AttentionTracker::global(cx).map(|attention_tracker| {
+                cx.observe(&attention_tracker, |this, _, cx| {
+                    this.picker.update(cx, |_, cx| cx.notify());
+                })
+            });
+
             Self {
                 picker,
                 _load_recent_projects: load_recent_projects,
+                _observe_attention: observe_attention,
             }
         });
     }
@@ -531,6 +789,8 @@ enum Row {
     View {
         session: Session,
         view: SessionView,
+        /// The view's index for `ActivateView`.
+        index: usize,
     },
     Recent {
         name: SharedString,
@@ -549,7 +809,7 @@ impl Row {
                     None => name.to_string(),
                 }
             }
-            Row::View { session, view } => format!(
+            Row::View { session, view, .. } => format!(
                 "{} {}",
                 session_name(&session.workspace, cx),
                 view_title(view, cx)
@@ -591,9 +851,11 @@ impl SessionSwitcherDelegate {
                 rows.extend(
                     session_views(session.workspace.read(cx), cx)
                         .into_iter()
-                        .map(|view| Row::View {
+                        .enumerate()
+                        .map(|(index, view)| Row::View {
                             session: session.clone(),
                             view,
+                            index,
                         }),
                 );
             }
@@ -678,6 +940,16 @@ impl SessionSwitcherDelegate {
         };
         position.unwrap_or(0)
     }
+
+    /// Nested rows sit under their session and next to their working directory, so they use
+    /// the compact title. Filtered rows stand alone and keep the full title.
+    fn display_title(&self, view: &SessionView, cx: &App) -> SharedString {
+        if self.has_query {
+            view_title(view, cx)
+        } else {
+            compact_view_title(view, cx)
+        }
+    }
 }
 
 impl PickerDelegate for SessionSwitcherDelegate {
@@ -704,6 +976,10 @@ impl PickerDelegate for SessionSwitcherDelegate {
 
     fn selected_index(&self) -> usize {
         self.selected_index
+    }
+
+    fn select_on_hover(&self) -> bool {
+        false
     }
 
     fn set_selected_index(
@@ -761,7 +1037,7 @@ impl PickerDelegate for SessionSwitcherDelegate {
         let current_window = self.current_window;
         cx.defer(move |cx| match row {
             Row::Session(session) => activate_session(&session, None, cx),
-            Row::View { session, view } => activate_session(&session, Some(view), cx),
+            Row::View { session, view, .. } => activate_session(&session, Some(view), cx),
             Row::Recent { paths, .. } => open_recent_project(current_window, paths, cx),
         });
     }
@@ -796,18 +1072,32 @@ impl PickerDelegate for SessionSwitcherDelegate {
                     1 => "1 terminal".to_string(),
                     count => format!("{count} terminals"),
                 });
+                let attention_count = attention_count(session.workspace.read(cx), cx);
                 item.start_slot(Icon::new(IconName::FolderOpen).color(Color::Muted))
                     .child(row_label(
                         session_name(&session.workspace, cx),
                         Some(details.join(" · ").into()),
                     ))
-                    .end_slot::<Label>(session.is_current.then(|| {
-                        Label::new("current")
-                            .color(Color::Muted)
-                            .size(LabelSize::Small)
-                    }))
+                    .end_slot(
+                        h_flex()
+                            .gap_2()
+                            .when(attention_count > 0, |this| {
+                                this.child(render_attention_count(attention_count))
+                            })
+                            .when(session.is_current, |this| {
+                                this.child(
+                                    Label::new("current")
+                                        .color(Color::Muted)
+                                        .size(LabelSize::Small),
+                                )
+                            }),
+                    )
             }
-            Row::View { session, view } => {
+            Row::View {
+                session,
+                view,
+                index,
+            } => {
                 let icon = match view {
                     SessionView::Editor => IconName::FileCode,
                     SessionView::Terminal { .. } => IconName::Terminal,
@@ -832,12 +1122,23 @@ impl PickerDelegate for SessionSwitcherDelegate {
                 let status = match view {
                     SessionView::Editor => None,
                     SessionView::Terminal { terminal_view, .. } => {
-                        render_terminal_status(terminal_view.read(cx), cx)
+                        render_terminal_status(terminal_view, cx)
                     }
                 };
                 item.indent_level(indent_level)
                     .start_slot(Icon::new(icon).color(Color::Muted))
-                    .child(row_label(view_title(view, cx), detail))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(
+                                Label::new(index.to_string())
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .child(row_label(self.display_title(view, cx), detail)),
+                    )
                     .end_slot::<AnyElement>(status)
             }
             Row::Recent { name, location, .. } => item
@@ -845,5 +1146,96 @@ impl PickerDelegate for SessionSwitcherDelegate {
                 .child(row_label(name.clone(), Some(location.clone()))),
         };
         Some(item)
+    }
+}
+
+/// Status bar count of terminals needing attention across all sessions, hidden when there are
+/// none. Clicking it jumps to the next one.
+struct AttentionIndicator {
+    _observe_attention: Option<Subscription>,
+    _observe_settings: Subscription,
+}
+
+impl AttentionIndicator {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            _observe_attention: AttentionTracker::global(cx)
+                .map(|attention_tracker| cx.observe(&attention_tracker, |_, _, cx| cx.notify())),
+            _observe_settings: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+        }
+    }
+
+    /// Counts across all windows. The window being rendered is borrowed, so its
+    /// `MultiWorkspace` is read through `window` rather than through its handle.
+    fn total_attention_count(window: &Window, cx: &App) -> usize {
+        let current_window_id = window.window_handle().window_id();
+        let mut multi_workspaces = Vec::new();
+        for handle in cx.windows() {
+            if handle.window_id() == current_window_id {
+                if let Some(Some(multi_workspace)) = window.root::<MultiWorkspace>() {
+                    multi_workspaces.push(multi_workspace);
+                }
+            } else if let Some(handle) = handle.downcast::<MultiWorkspace>()
+                && let Ok(multi_workspace) = handle.entity(cx)
+            {
+                multi_workspaces.push(multi_workspace);
+            }
+        }
+        multi_workspaces
+            .iter()
+            .flat_map(|multi_workspace| multi_workspace.read(cx).workspaces())
+            .map(|workspace| attention_count(workspace.read(cx), cx))
+            .sum()
+    }
+}
+
+impl Render for AttentionIndicator {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = if SessionSwitcherSettings::get_global(cx).show_attention_count {
+            Self::total_attention_count(window, cx)
+        } else {
+            0
+        };
+        if count == 0 {
+            return div().into_any_element();
+        }
+        let button = Button::new("session-switcher-attention-count", count.to_string())
+            .start_icon(
+                Icon::new(IconName::Warning)
+                    .color(Color::Warning)
+                    .size(IconSize::Small),
+            )
+            .label_size(LabelSize::Small)
+            .color(Color::Warning)
+            .tooltip(Tooltip::for_action_title(
+                "Jump to Terminal Needing Attention",
+                &JumpToNextAttention,
+            ))
+            .on_click(|_, window, cx| {
+                window.dispatch_action(JumpToNextAttention.boxed_clone(), cx);
+            });
+        div()
+            .debug_selector(|| "session-switcher-attention-count".into())
+            .child(button)
+            .into_any_element()
+    }
+}
+
+impl StatusItemView for AttentionIndicator {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        Some(HideStatusItem::new(|settings| {
+            settings
+                .session_switcher
+                .get_or_insert_default()
+                .show_attention_count = Some(false);
+        }))
     }
 }
