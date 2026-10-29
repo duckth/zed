@@ -191,6 +191,7 @@ members = [
     "crates/schema_generator",
     "crates/search",
     "crates/session",
+    "crates/session_switcher",
     "crates/settings",
     "crates/settings_content",
     "crates/settings_json",
@@ -464,6 +465,7 @@ sandbox = { path = "crates/sandbox" }
 scheduler = { path = "crates/scheduler" }
 search = { path = "crates/search" }
 session = { path = "crates/session" }
+session_switcher = { path = "crates/session_switcher" }
 settings = { path = "crates/settings" }
 settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json", default-features = false }

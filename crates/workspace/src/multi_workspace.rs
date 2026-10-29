@@ -1308,6 +1308,16 @@ impl MultiWorkspace {
         self.held.iter().map(|held| &held.workspace)
     }
 
+    /// The workspaces held by this window, most recently displayed first.
+    /// Workspaces that were never displayed come last, in insertion order.
+    pub fn workspaces_by_recency(&self) -> Vec<Entity<Workspace>> {
+        let mut held: Vec<&HeldWorkspace> = self.held.iter().collect();
+        held.sort_by_key(|held| std::cmp::Reverse(held.activated_at));
+        held.into_iter()
+            .map(|held| held.workspace.clone())
+            .collect()
+    }
+
     /// Adds a workspace to this window as persistent without changing which
     /// workspace is active. Unlike `activate()`, this always inserts into the
     /// persistent list regardless of sidebar state — it's used for system-
