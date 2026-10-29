@@ -19,7 +19,7 @@ pub mod inlay_hints;
 
 use std::sync::OnceLock;
 
-use gpui::{Context, HighlightStyle, Hsla, Rgba, Task};
+use gpui::{Context, HighlightStyle, Hsla, Rgba, SharedString, Task};
 use multi_buffer::Anchor;
 use project::{InlayHint, InlayId};
 use text::Rope;
@@ -54,6 +54,8 @@ pub struct Inlay {
 pub enum InlayContent {
     Text(text::Rope),
     Color(Hsla),
+    /// The path of an SVG icon, e.g. from the icon theme.
+    Icon(SharedString),
 }
 
 impl Inlay {
@@ -91,6 +93,14 @@ impl Inlay {
         }
     }
 
+    pub fn icon(id: usize, position: Anchor, path: SharedString) -> Self {
+        Self {
+            id: InlayId::Icon(id),
+            position,
+            content: InlayContent::Icon(path),
+        }
+    }
+
     pub fn edit_prediction<T: Into<Rope>>(id: usize, position: Anchor, text: T) -> Self {
         Self {
             id: InlayId::EditPrediction(id),
@@ -117,9 +127,11 @@ impl Inlay {
 
     pub fn text(&self) -> &Rope {
         static COLOR_TEXT: OnceLock<Rope> = OnceLock::new();
+        static ICON_TEXT: OnceLock<Rope> = OnceLock::new();
         match &self.content {
             InlayContent::Text(text) => text,
             InlayContent::Color(_) => COLOR_TEXT.get_or_init(|| Rope::from("◼")),
+            InlayContent::Icon(_) => ICON_TEXT.get_or_init(|| Rope::from("▫")),
         }
     }
 

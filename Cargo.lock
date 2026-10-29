@@ -6269,6 +6269,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "file_browser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "command_palette",
+ "editor",
+ "file_icons",
+ "gpui",
+ "language",
+ "menu",
+ "project",
+ "search",
+ "serde_json",
+ "settings",
+ "similar",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "vim",
+ "workspace",
+]
+
+[[package]]
 name = "file_content"
 version = "0.1.0"
 dependencies = [
@@ -22423,6 +22448,7 @@ dependencies = [
  "extensions_ui",
  "feature_flags",
  "feedback",
+ "file_browser",
  "file_finder",
  "fs",
  "futures 0.3.34",
