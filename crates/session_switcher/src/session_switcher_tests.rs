@@ -1,7 +1,8 @@
 use super::*;
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
 use project::Project;
 use serde_json::json;
+use settings::SettingsStore;
 use terminal::{
     TerminalBuilder,
     terminal_settings::{AlternateScroll, CursorShape},
@@ -183,7 +184,9 @@ fn describe_rows(
                         let current = if session.is_current { " current" } else { "" };
                         format!("[{}]{current}", session_name(&session.workspace, cx))
                     }
-                    Row::View { view, .. } => view_title(view, cx).to_string(),
+                    Row::View { view, index, .. } => {
+                        format!("{index} {}", delegate.display_title(view, cx))
+                    }
                     Row::Recent { name, .. } => format!("({name})"),
                 };
                 format!("{marker} {description}")
@@ -343,16 +346,16 @@ async fn test_switcher_lists_sessions_with_their_views(cx: &mut TestAppContext) 
         describe_rows(&picker, cx),
         [
             "  [root_b] current",
-            "  editor",
+            "  0 editor",
             "> [root_a]",
-            "  editor",
-            "  rails",
-            "  zsh",
+            "  0 editor",
+            "  1 rails",
+            "  2 zsh",
         ],
         "the current session comes first, and the previous session is preselected"
     );
 
-    select_row(&picker, "rails", cx);
+    select_row(&picker, "1 rails", cx);
     confirm_selected(&picker, cx);
     multi_workspace.read_with(cx, |mw, _| assert_eq!(mw.workspace(), &workspace_a));
     assert!(is_focused(&server, cx));
@@ -409,7 +412,7 @@ async fn test_switcher_modes_and_filtering(cx: &mut TestAppContext) {
     );
     assert_eq!(
         describe_rows(&picker, cx),
-        ["  editor", "  rails", "> zsh"],
+        ["  0 editor", "  1 rails", "> 2 zsh"],
         "with the editor focused, the last used terminal is preselected"
     );
     cx.dispatch_action(menu::Cancel);
@@ -420,7 +423,7 @@ async fn test_switcher_modes_and_filtering(cx: &mut TestAppContext) {
         picker.set_query("rails", window, cx)
     });
     cx.run_until_parked();
-    assert_eq!(describe_rows(&picker, cx), ["> rails"]);
+    assert_eq!(describe_rows(&picker, cx), ["> 1 rails"]);
 }
 
 #[gpui::test]
@@ -458,7 +461,7 @@ async fn test_switcher_lists_recent_projects_that_are_not_open(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(
         describe_rows(&picker, cx),
-        ["> [root_a] current", "  editor", "  (recent)"],
+        ["> [root_a] current", "  0 editor", "  (recent)"],
         "projects that are already open are not repeated as recent projects"
     );
     picker.read_with(cx, |picker, _| {
@@ -472,4 +475,190 @@ async fn test_switcher_lists_recent_projects_that_are_not_open(cx: &mut TestAppC
         assert_eq!(session_name(mw.workspace(), cx), "recent");
         assert!(mw.workspaces().any(|workspace| workspace == &workspace_a));
     });
+}
+
+#[test]
+fn test_strip_directory_prefix() {
+    let working_directory = Path::new("/projects/zeduck");
+    assert_eq!(
+        strip_directory_prefix("zeduck — sleep 10000", Some(working_directory)),
+        Some("sleep 10000")
+    );
+    assert_eq!(
+        strip_directory_prefix("zeduck — zsh", Some(working_directory)),
+        Some("zsh")
+    );
+    assert_eq!(
+        strip_directory_prefix("core — zsh", Some(working_directory)),
+        None,
+        "a different directory's prefix is kept"
+    );
+    assert_eq!(
+        strip_directory_prefix("zeduck-fork — zsh", Some(working_directory)),
+        None,
+        "only an exact directory name matches"
+    );
+    assert_eq!(
+        strip_directory_prefix("zeduck — ", Some(working_directory)),
+        None,
+        "an empty process part is not stripped down to nothing"
+    );
+    assert_eq!(strip_directory_prefix("zeduck — zsh", None), None);
+}
+
+fn set_program_state(
+    terminal_view: &Entity<TerminalView>,
+    state: Option<ProgramState>,
+    cx: &mut VisualTestContext,
+) {
+    terminal_view.update(cx, |terminal_view, cx| {
+        terminal_view.terminal().clone().update(cx, |terminal, cx| {
+            terminal.simulate_program_state(state, cx)
+        });
+    });
+    cx.run_until_parked();
+}
+
+fn attention(terminal_view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> bool {
+    cx.read(|cx| needs_attention(terminal_view, cx))
+}
+
+fn total_attention_count(cx: &mut VisualTestContext) -> usize {
+    cx.update(|window, cx| AttentionIndicator::total_attention_count(window, cx))
+}
+
+fn attention_indicator_shown(cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    cx.debug_bounds("session-switcher-attention-count")
+        .is_some()
+}
+
+#[gpui::test]
+async fn test_terminals_needing_attention(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    let project = project(&app_state, path!("/root_a"), cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let panel = add_terminal_panel(&workspace, cx);
+    let waiting = add_terminal(&workspace, &panel, "waiting", cx);
+    let finished = add_terminal(&workspace, &panel, "finished", cx);
+    let shell = add_terminal(&workspace, &panel, "zsh", cx);
+    focus_editor(&workspace, cx);
+
+    set_program_state(&waiting, Some(ProgramState::Blocked), cx);
+    set_program_state(&finished, Some(ProgramState::Working), cx);
+    assert!(attention(&waiting, cx));
+    assert!(
+        !attention(&finished, cx),
+        "working programs don't need attention"
+    );
+    assert!(!attention(&shell, cx));
+
+    set_program_state(&finished, Some(ProgramState::Done), cx);
+    assert!(
+        attention(&finished, cx),
+        "finishing while unfocused needs attention"
+    );
+    assert_eq!(total_attention_count(cx), 2);
+    workspace.read_with(cx, |workspace, cx| {
+        assert_eq!(attention_count(workspace, cx), 2);
+    });
+    assert!(attention_indicator_shown(cx));
+
+    cx.dispatch_action(ActivateView(2));
+    cx.run_until_parked();
+    assert!(is_focused(&finished, cx));
+    assert!(!attention(&finished, cx), "looking at it clears done");
+    assert_eq!(total_attention_count(cx), 1);
+
+    set_program_state(&finished, Some(ProgramState::Working), cx);
+    set_program_state(&finished, Some(ProgramState::Done), cx);
+    assert!(
+        !attention(&finished, cx),
+        "finishing while focused does not need attention"
+    );
+
+    set_program_state(&shell, Some(ProgramState::Error), cx);
+    set_program_state(&waiting, None, cx);
+    assert!(attention(&shell, cx));
+    assert!(
+        !attention(&waiting, cx),
+        "a cleared status needs no attention"
+    );
+    assert_eq!(total_attention_count(cx), 1);
+
+    cx.update(|_, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .session_switcher
+                    .get_or_insert_default()
+                    .show_attention_count = Some(false);
+            });
+        });
+    });
+    assert!(
+        !attention_indicator_shown(cx),
+        "the status bar count can be turned off"
+    );
+
+    cx.update(|_, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .session_switcher
+                    .get_or_insert_default()
+                    .show_attention_count = Some(true);
+            });
+        });
+    });
+    assert!(attention_indicator_shown(cx));
+    set_program_state(&shell, Some(ProgramState::Idle), cx);
+    assert!(
+        !attention_indicator_shown(cx),
+        "the count is hidden when nothing needs attention"
+    );
+}
+
+#[gpui::test]
+async fn test_jump_to_next_attention_visits_every_session(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    let project_a = project(&app_state, path!("/root_a"), cx).await;
+    let project_b = project(&app_state, path!("/root_b"), cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let panel_a = add_terminal_panel(&workspace_a, cx);
+    let first = add_terminal(&workspace_a, &panel_a, "first", cx);
+    let quiet = add_terminal(&workspace_a, &panel_a, "quiet", cx);
+    let second = add_terminal(&workspace_a, &panel_a, "second", cx);
+    let workspace_b = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b, window, cx)
+    });
+    let panel_b = add_terminal_panel(&workspace_b, cx);
+    let failed = add_terminal(&workspace_b, &panel_b, "failed", cx);
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(workspace_a.clone(), None, window, cx);
+    });
+    focus_editor(&workspace_a, cx);
+
+    set_program_state(&first, Some(ProgramState::Blocked), cx);
+    set_program_state(&quiet, Some(ProgramState::Working), cx);
+    set_program_state(&second, Some(ProgramState::Blocked), cx);
+    set_program_state(&failed, Some(ProgramState::Error), cx);
+
+    for (expected, workspace) in [
+        (&first, &workspace_a),
+        (&second, &workspace_a),
+        (&failed, &workspace_b),
+        (&first, &workspace_a),
+    ] {
+        cx.dispatch_action(JumpToNextAttention);
+        cx.run_until_parked();
+        multi_workspace.read_with(cx, |mw, _| assert_eq!(mw.workspace(), workspace));
+        assert!(is_focused(expected, cx));
+    }
+    assert!(!is_focused(&quiet, cx));
 }

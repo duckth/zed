@@ -30,6 +30,7 @@ gpui.workspace = true
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true
+polling.workspace = true
 regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true
