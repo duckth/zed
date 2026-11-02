@@ -4,7 +4,7 @@ use project::Project;
 use serde_json::json;
 use settings::SettingsStore;
 use terminal::{
-    TerminalBuilder,
+    ProgramStatus, TerminalBuilder,
     terminal_settings::{AlternateScroll, CursorShape},
 };
 use util::{path, path_list::PathList, paths::PathStyle};
@@ -506,6 +506,22 @@ fn test_strip_directory_prefix() {
     assert_eq!(strip_directory_prefix("zeduck — zsh", None), None);
 }
 
+#[test]
+fn test_shorten_process_title() {
+    assert_eq!(shorten_process_title("zsh"), "zsh");
+    assert_eq!(
+        shorten_process_title(
+            "zsh __CF_USER_TEXT_ENCODING=0x0:0:2 __MISE_DIFF=eAFqX bin/rails server -p 3000"
+        ),
+        "zsh bin/rails server"
+    );
+    assert_eq!(
+        shorten_process_title("env RAILS_ENV=test /usr/bin/ruby bin/rspec"),
+        "ruby bin/rspec"
+    );
+    assert_eq!(shorten_process_title("A=1 B=2"), "A=1 B=2");
+}
+
 fn set_program_state(
     terminal_view: &Entity<TerminalView>,
     state: Option<ProgramState>,
@@ -513,7 +529,12 @@ fn set_program_state(
 ) {
     terminal_view.update(cx, |terminal_view, cx| {
         terminal_view.terminal().clone().update(cx, |terminal, cx| {
-            terminal.simulate_program_state(state, cx)
+            let status = state.map(|state| ProgramStatus {
+                state,
+                app: None,
+                kind: None,
+            });
+            terminal.simulate_program_status(status, cx)
         });
     });
     cx.run_until_parked();

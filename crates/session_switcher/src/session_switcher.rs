@@ -555,7 +555,12 @@ fn view_title(view: &SessionView, cx: &App) -> SharedString {
     match view {
         SessionView::Editor => "editor".into(),
         SessionView::Terminal { terminal_view, .. } => {
-            terminal_view.read(cx).tab_content_text(0, cx)
+            let terminal_view = terminal_view.read(cx);
+            let has_custom_title = terminal_view.custom_title().is_some();
+            match terminal_view.terminal().read(cx).program_app() {
+                Some(app) if !has_custom_title => app_display_name(app).to_string().into(),
+                _ => terminal_view.tab_content_text(0, cx),
+            }
         }
     }
 }
@@ -574,12 +579,46 @@ fn compact_view_title(view: &SessionView, cx: &App) -> SharedString {
     if has_custom_title || terminal.task().is_some() {
         return view_title(view, cx);
     }
+    if let Some(app) = terminal.program_app() {
+        return app_display_name(app).into();
+    }
     let title = terminal.title(false);
     let working_directory = terminal.working_directory();
     match strip_directory_prefix(&title, working_directory.as_deref()) {
-        Some(process) => process.to_string().into(),
+        Some(process) => shorten_process_title(process).into(),
         None => view_title(view, cx),
     }
+}
+
+fn app_display_name(app: &str) -> &str {
+    match app {
+        "claude-code" => "claude",
+        app => app,
+    }
+}
+
+/// Process titles include the full command line, which wrappers such as `env` or mise prefix
+/// with environment variables. Keeps the program and its first two arguments, skipping those.
+fn shorten_process_title(process: &str) -> String {
+    let is_assignment = |word: &&str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        })
+    };
+    let mut words = process
+        .split_whitespace()
+        .filter(|word| *word != "env" && !is_assignment(word));
+    let Some(program) = words.next() else {
+        return process.to_string();
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    std::iter::once(program)
+        .chain(words.take(2))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `Terminal::title` composes shell titles as `<working directory name> — <process>`, with
@@ -622,11 +661,16 @@ fn view_detail(session: &Session, view: &SessionView, cx: &App) -> Option<Shared
 }
 
 fn render_terminal_status(terminal_view: &Entity<TerminalView>, cx: &App) -> Option<AnyElement> {
-    let program_state = terminal_view.read(cx).terminal().read(cx).program_state();
-    let (icon, color, label) = if let Some(program_state) = program_state {
+    let terminal = terminal_view.read(cx).terminal().read(cx);
+    let (icon, color, label) = if let Some(program_state) = terminal.program_state() {
         match program_state {
             ProgramState::Working => (IconName::ArrowCircle, Color::Accent, "working"),
-            ProgramState::Blocked => (IconName::Warning, Color::Warning, "waiting"),
+            ProgramState::Blocked => match terminal.program_blocked_kind() {
+                Some("permission") => (IconName::Lock, Color::Warning, "permission"),
+                Some("question") => (IconName::CircleHelp, Color::Warning, "question"),
+                Some("auth") => (IconName::UserCheck, Color::Warning, "sign in"),
+                _ => (IconName::Warning, Color::Warning, "waiting"),
+            },
             ProgramState::Done if needs_attention(terminal_view, cx) => {
                 (IconName::Check, Color::Success, "done")
             }
@@ -657,13 +701,13 @@ fn render_attention_count(count: usize) -> impl IntoElement {
     h_flex()
         .gap_1()
         .child(
-            Icon::new(IconName::Warning)
-                .color(Color::Warning)
+            Icon::new(IconName::Bell)
+                .color(Color::Muted)
                 .size(IconSize::Small),
         )
         .child(
             Label::new(count.to_string())
-                .color(Color::Warning)
+                .color(Color::Muted)
                 .size(LabelSize::Small),
         )
 }
@@ -1114,32 +1158,33 @@ impl PickerDelegate for SessionSwitcherDelegate {
                 } else {
                     detail
                 };
-                let indent_level = if self.has_query || self.mode == Mode::CurrentSession {
-                    0
-                } else {
-                    1
-                };
+                let indented = !self.has_query && self.mode != Mode::CurrentSession;
                 let status = match view {
                     SessionView::Editor => None,
                     SessionView::Terminal { terminal_view, .. } => {
                         render_terminal_status(terminal_view, cx)
                     }
                 };
-                item.indent_level(indent_level)
-                    .start_slot(Icon::new(icon).color(Color::Muted))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(
-                                Label::new(index.to_string())
-                                    .color(Color::Muted)
-                                    .size(LabelSize::Small),
-                            )
-                            .child(row_label(self.display_title(view, cx), detail)),
-                    )
-                    .end_slot::<AnyElement>(status)
+                // Inset list items indent with a margin on a full-width row, which pushes the
+                // end slot out of the picker, so indent the start slot instead.
+                item.start_slot(
+                    div()
+                        .when(indented, |this| this.pl_3())
+                        .child(Icon::new(icon).color(Color::Muted)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(
+                            Label::new(index.to_string())
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                        .child(row_label(self.display_title(view, cx), detail)),
+                )
+                .end_slot::<AnyElement>(status)
             }
             Row::Recent { name, location, .. } => item
                 .start_slot(Icon::new(IconName::Folder).color(Color::Muted))
@@ -1201,12 +1246,12 @@ impl Render for AttentionIndicator {
         }
         let button = Button::new("session-switcher-attention-count", count.to_string())
             .start_icon(
-                Icon::new(IconName::Warning)
-                    .color(Color::Warning)
+                Icon::new(IconName::Bell)
+                    .color(Color::Muted)
                     .size(IconSize::Small),
             )
             .label_size(LabelSize::Small)
-            .color(Color::Warning)
+            .color(Color::Muted)
             .tooltip(Tooltip::for_action_title(
                 "Jump to Terminal Needing Attention",
                 &JumpToNextAttention,

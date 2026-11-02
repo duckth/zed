@@ -259,8 +259,8 @@ impl io::Read for ProgramStatusPty {
             .scan(buffer.get(..count).unwrap_or_default(), |sequence| {
                 let event = match sequence {
                     ProgramStatusSequence::Query => TerminalBackendEvent::ProgramStatusQuery,
-                    ProgramStatusSequence::State(state) => {
-                        TerminalBackendEvent::ProgramStatus(state)
+                    ProgramStatusSequence::Status(status) => {
+                        TerminalBackendEvent::ProgramStatus(status)
                     }
                 };
                 // Sending only fails once the terminal is gone, like in `ZedListener`.

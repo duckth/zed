@@ -23,11 +23,20 @@ pub enum ProgramState {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    /// The reporting program's name for itself, such as `claude-code`.
+    pub app: Option<String>,
+    /// What a blocked program is waiting for, such as `permission`, `question` or `auth`.
+    pub kind: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramStatusSequence {
     Query,
     /// `None` when the program cleared its status, e.g. on exit.
-    State(Option<ProgramState>),
+    Status(Option<ProgramStatus>),
 }
 
 /// Finds program status sequences in a stream of PTY output, which may split them across reads.
@@ -124,12 +133,16 @@ fn parse_payload(payload: &[u8]) -> Option<ProgramStatusSequence> {
     }
 
     let mut state = None;
+    let mut app = None;
+    let mut kind = None;
     for field in payload.split(':') {
         match field.split_once('=') {
             // Sequences with an id report on a program's background tasks rather than the
             // program itself.
             Some(("id", _)) => return None,
             Some(("state", value)) => state = Some(value),
+            Some(("app", value)) if !value.is_empty() => app = Some(value.to_string()),
+            Some(("kind", value)) if !value.is_empty() => kind = Some(value.to_string()),
             _ => {}
         }
     }
@@ -143,12 +156,22 @@ fn parse_payload(payload: &[u8]) -> Option<ProgramStatusSequence> {
         "clear" => None,
         _ => return None,
     };
-    Some(ProgramStatusSequence::State(state))
+    Some(ProgramStatusSequence::Status(
+        state.map(|state| ProgramStatus { state, app, kind }),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(state: ProgramState, app: Option<&str>) -> ProgramStatusSequence {
+        ProgramStatusSequence::Status(Some(ProgramStatus {
+            state,
+            app: app.map(str::to_string),
+            kind: None,
+        }))
+    }
 
     fn scan_chunks(chunks: &[&[u8]]) -> Vec<ProgramStatusSequence> {
         let mut scanner = ProgramStatusScanner::default();
@@ -170,12 +193,16 @@ mod tests {
                 b"\x1b]7501;state=clear\x1b\\",
             ]),
             [
-                ProgramStatusSequence::State(Some(ProgramState::Working)),
-                ProgramStatusSequence::State(Some(ProgramState::Blocked)),
-                ProgramStatusSequence::State(Some(ProgramState::Done)),
-                ProgramStatusSequence::State(Some(ProgramState::Idle)),
-                ProgramStatusSequence::State(Some(ProgramState::Error)),
-                ProgramStatusSequence::State(None),
+                status(ProgramState::Working, Some("claude-code")),
+                ProgramStatusSequence::Status(Some(ProgramStatus {
+                    state: ProgramState::Blocked,
+                    app: Some("claude-code".to_string()),
+                    kind: Some("permission".to_string()),
+                })),
+                status(ProgramState::Done, Some("claude-code")),
+                status(ProgramState::Idle, None),
+                status(ProgramState::Error, None),
+                ProgramStatusSequence::Status(None),
             ]
         );
     }
@@ -192,7 +219,7 @@ mod tests {
     fn test_handles_sequences_split_across_reads() {
         assert_eq!(
             scan_chunks(&[b"abc\x1b", b"]75", b"01;sta", b"te=done", b"\x1b", b"\\"]),
-            [ProgramStatusSequence::State(Some(ProgramState::Done))]
+            [status(ProgramState::Done, None)]
         );
     }
 
@@ -218,7 +245,7 @@ mod tests {
                 &oversized,
                 b"\x07\x1b]7501;state=idle\x07",
             ]),
-            [ProgramStatusSequence::State(Some(ProgramState::Idle))],
+            [status(ProgramState::Idle, None)],
             "an unterminated or oversized sequence is dropped without losing the next one"
         );
     }

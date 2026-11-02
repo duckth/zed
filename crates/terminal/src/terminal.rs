@@ -36,7 +36,7 @@ use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
 use program_status::PROGRAM_STATUS_QUERY_REPLY;
-pub use program_status::ProgramState;
+pub use program_status::{ProgramState, ProgramStatus};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::{
@@ -743,7 +743,7 @@ pub(crate) enum TerminalBackendEvent {
     Exit,
     ChildExit(ExitStatus),
     ProgramStatusQuery,
-    ProgramStatus(Option<ProgramState>),
+    ProgramStatus(Option<ProgramStatus>),
 }
 
 impl fmt::Debug for TerminalBackendEvent {
@@ -763,7 +763,7 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
             Self::ProgramStatusQuery => f.write_str("ProgramStatusQuery"),
-            Self::ProgramStatus(state) => write!(f, "ProgramStatus({state:?})"),
+            Self::ProgramStatus(status) => write!(f, "ProgramStatus({status:?})"),
         }
     }
 }
@@ -1057,7 +1057,7 @@ impl TerminalBuilder {
 
             selection_head: None,
             breadcrumb_text: String::new(),
-            program_state: None,
+            program_status: None,
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -1345,7 +1345,7 @@ impl TerminalBuilder {
 
                 selection_head: None,
                 breadcrumb_text: String::new(),
-                program_state: None,
+                program_status: None,
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1553,7 +1553,7 @@ pub struct Terminal {
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
-    program_state: Option<ProgramState>,
+    program_status: Option<ProgramStatus>,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1739,9 +1739,9 @@ impl Terminal {
             TerminalBackendEvent::ProgramStatusQuery => {
                 self.write_to_pty(PROGRAM_STATUS_QUERY_REPLY);
             }
-            TerminalBackendEvent::ProgramStatus(state) => {
-                if self.program_state != state {
-                    self.program_state = state;
+            TerminalBackendEvent::ProgramStatus(status) => {
+                if self.program_status != status {
+                    self.program_status = status;
                     cx.emit(Event::ProgramStateChanged);
                 }
             }
@@ -3210,13 +3210,27 @@ impl Terminal {
     /// The state last reported by the program running in the terminal via the OSC 7501 program
     /// status protocol, if any.
     pub fn program_state(&self) -> Option<ProgramState> {
-        self.program_state
+        self.program_status.as_ref().map(|status| status.state)
+    }
+
+    /// The name the program reporting its status gave itself, such as `claude-code`.
+    pub fn program_app(&self) -> Option<&str> {
+        self.program_status.as_ref()?.app.as_deref()
+    }
+
+    /// What the program is waiting for while blocked, such as `permission`, `question` or `auth`.
+    pub fn program_blocked_kind(&self) -> Option<&str> {
+        self.program_status.as_ref()?.kind.as_deref()
     }
 
     /// Handles a program status report as if the program had written it to the PTY.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn simulate_program_state(&mut self, state: Option<ProgramState>, cx: &mut Context<Self>) {
-        self.process_event(TerminalBackendEvent::ProgramStatus(state), cx);
+    pub fn simulate_program_status(
+        &mut self,
+        status: Option<ProgramStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        self.process_event(TerminalBackendEvent::ProgramStatus(status), cx);
     }
 
     pub fn task(&self) -> Option<&TaskState> {
