@@ -354,7 +354,13 @@ impl MultiWorkspace {
             move |this, window, cx| {
                 let multi_workspace_enabled = this.multi_workspace_enabled(cx);
                 if previous_multi_workspace_enabled && !multi_workspace_enabled {
-                    this.collapse_to_single_workspace(window, cx);
+                    if this.retains_workspaces() {
+                        if this.sidebar_open() {
+                            this.close_sidebar(window, cx);
+                        }
+                    } else {
+                        this.collapse_to_single_workspace(window, cx);
+                    }
                 }
                 previous_multi_workspace_enabled = multi_workspace_enabled;
             }
@@ -425,6 +431,14 @@ impl MultiWorkspace {
 
     pub fn multi_workspace_enabled(&self, cx: &App) -> bool {
         !DisableAiSettings::get_global(cx).disable_ai && AgentSettings::get_global(cx).enabled
+    }
+
+    /// Whether workspaces stay alive (with their terminals) when navigated
+    /// away from. Upstream ties this to `multi_workspace_enabled`; this fork
+    /// keeps workspaces alive regardless of AI settings, so only the agent
+    /// sidebar remains gated on AI.
+    pub fn retains_workspaces(&self) -> bool {
+        true
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1309,6 +1323,16 @@ impl MultiWorkspace {
         self.held.iter().map(|held| &held.workspace)
     }
 
+    /// The workspaces held by this window, most recently displayed first.
+    /// Workspaces that were never displayed come last, in insertion order.
+    pub fn workspaces_by_recency(&self) -> Vec<Entity<Workspace>> {
+        let mut held: Vec<&HeldWorkspace> = self.held.iter().collect();
+        held.sort_by_key(|held| std::cmp::Reverse(held.activated_at));
+        held.into_iter()
+            .map(|held| held.workspace.clone())
+            .collect()
+    }
+
     /// Adds a workspace to this window as persistent without changing which
     /// workspace is active. Unlike `activate()`, this always inserts into the
     /// persistent list regardless of sidebar state — it's used for system-
@@ -1342,7 +1366,7 @@ impl MultiWorkspace {
 
         let old_active_workspace = self.workspace().clone();
         let old_active_was_retained = self.active_workspace_is_retained();
-        let should_retain_workspaces = self.multi_workspace_enabled(cx);
+        let should_retain_workspaces = self.retains_workspaces();
 
         if should_retain_workspaces && !old_active_was_retained {
             let key = old_active_workspace.read(cx).project_group_key(cx);
@@ -1952,7 +1976,7 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if self.multi_workspace_enabled(cx) {
+        if self.retains_workspaces() {
             let empty_workspace = if self
                 .workspace()
                 .read(cx)

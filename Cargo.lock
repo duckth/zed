@@ -16318,6 +16318,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "session_switcher"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "collections",
+ "editor",
+ "fs",
+ "fuzzy_nucleo",
+ "gpui",
+ "menu",
+ "picker",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "terminal",
+ "terminal_view",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "settings"
 version = "0.1.0"
 dependencies = [
@@ -17973,6 +17999,7 @@ dependencies = [
  "log",
  "parking_lot",
  "percent-encoding",
+ "polling",
  "rand 0.9.4",
  "regex",
  "release_channel",
@@ -22533,6 +22560,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session",
+ "session_switcher",
  "settings",
  "settings_profile_selector",
  "settings_ui",

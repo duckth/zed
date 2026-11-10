@@ -1808,4 +1808,26 @@
       "right": ["tabular_data::MoveFocusedCell", { "direction": "right" }],
     },
   },
+  // Session switcher (fork-only). Left unbound on purpose; uncomment and adjust.
+  // {
+  //   "context": "Workspace",
+  //   "bindings": {
+  //     "ctrl-b w": "session_switcher::Toggle",
+  //     "ctrl-b s": ["session_switcher::Toggle", { "sessions_only": true }],
+  //     "ctrl-b W": ["session_switcher::Toggle", { "current_session_only": true }],
+  //     "ctrl-b m": "session_switcher::ToggleLastSession",
+  //     "ctrl-b l": "session_switcher::ToggleLastView",
+  //     "ctrl-b n": "session_switcher::NextView",
+  //     "ctrl-b p": "session_switcher::PreviousView",
+  //     "ctrl-b 0": ["session_switcher::ActivateView", 0],
+  //     "ctrl-b 1": ["session_switcher::ActivateView", 1],
+  //     "ctrl-b 2": ["session_switcher::ActivateView", 2],
+  //   },
+  // },
+  // {
+  //   "context": "Terminal",
+  //   "bindings": {
+  //     "ctrl-b ctrl-b": ["terminal::SendKeystroke", "ctrl-b"],
+  //   },
+  // },
 ]

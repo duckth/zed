@@ -6270,6 +6270,7 @@ mod tests {
                 "remote_debug",
                 "repl",
                 "search",
+                "session_switcher",
                 "settings_editor",
                 "settings_profile_selector",
                 "skill_creator",

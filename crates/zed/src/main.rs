@@ -742,6 +742,7 @@ fn main() {
         file_browser::init(cx);
         file_finder::init(cx);
         tab_switcher::init(cx);
+        session_switcher::init(cx);
         outline::init(cx);
         call_hierarchy::init(cx);
         project_symbols::init(cx);

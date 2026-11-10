@@ -234,6 +234,7 @@ impl VsCodeSettings {
             status_bar: self.status_bar_settings_content(),
             tab_bar: self.tab_bar_settings_content(),
             tab_switcher: None,
+            session_switcher: None,
             tabs: self.item_settings_content(),
             telemetry: self.telemetry_settings_content(),
             terminal: self.terminal_settings_content(),

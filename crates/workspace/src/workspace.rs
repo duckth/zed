@@ -11491,14 +11491,16 @@ pub fn open_paths(
                         .filter(|window| {
                             window
                                 .read(cx)
-                                .is_ok_and(|mw| mw.multi_workspace_enabled(cx))
+                                .is_ok_and(|mw| mw.retains_workspaces())
                         })
                 });
 
                 if let Some(window) = creation_window {
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            if AgentSettings::get_global(cx).threads_sidebar.auto_open {
+                            if multi_workspace.multi_workspace_enabled(cx)
+                                && AgentSettings::get_global(cx).threads_sidebar.auto_open
+                            {
                                 multi_workspace.open_sidebar(cx);
                             } else {
                                 // Opening the sidebar is also what pins the
