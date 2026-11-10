@@ -1253,6 +1253,34 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_vertical_motion_over_icons(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_vim(cx).await;
+        let fs = workspace.read_with(cx, |workspace, _| workspace.app_state().fs.clone());
+        for name in ["five", "four", "one", "six"] {
+            fs.as_fake()
+                .insert_file(path!("/root/docs/").to_string() + name, Vec::new())
+                .await;
+        }
+        open_file("src/main.rs", &workspace, cx).await;
+        cx.dispatch_action(Open);
+        cx.run_until_parked();
+        let browser = active_browser(&workspace, cx);
+        let docs = ["five", "four", "one", "six"];
+
+        cx.simulate_keystrokes("- k enter");
+        assert_listing(&browser, &docs, 0, cx);
+        cx.simulate_keystrokes("j j j");
+        assert_listing(&browser, &docs, 3, cx);
+        // The start of a line is before its icon, which isn't a valid cursor position. Moving up
+        // onto it used to land on the line above.
+        cx.simulate_keystrokes("k");
+        assert_listing(&browser, &docs, 2, cx);
+
+        cx.simulate_keystrokes("o escape k");
+        assert_listing(&browser, &["five", "four", "one", "", "six"], 2, cx);
+    }
+
+    #[gpui::test]
     async fn test_listing_follows_file_system_changes(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx).await;
         cx.dispatch_action(Open);

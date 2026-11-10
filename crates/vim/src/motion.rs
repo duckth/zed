@@ -1556,10 +1556,7 @@ fn up_down_buffer_rows(
     }
 
     let start = map.display_point_to_fold_point(point, Bias::Left);
-    let begin_folded_line = map.fold_point_to_display_point(
-        map.fold_snapshot()
-            .clip_point(FoldPoint::new(start.row(), 0), Bias::Left),
-    );
+    let begin_folded_line = fold_row_start(map, start.row(), Bias::Left);
     let select_nth_wrapped_row = point.row().0 - begin_folded_line.row().0;
 
     let (goal_wrap, goal_x) = match goal {
@@ -1576,10 +1573,7 @@ fn up_down_buffer_rows(
     let target = start.row() as isize + times;
     let new_row = (target.max(0) as u32).min(map.fold_snapshot().max_point().row());
 
-    let mut begin_folded_line = map.fold_point_to_display_point(
-        map.fold_snapshot()
-            .clip_point(FoldPoint::new(new_row, 0), bias),
-    );
+    let mut begin_folded_line = fold_row_start(map, new_row, bias);
 
     let mut i = 0;
     while i < goal_wrap && begin_folded_line.row() < map.max_point().row() {
@@ -1607,15 +1601,30 @@ fn up_down_buffer_rows(
 
     // When navigating vertically in vim mode with inlay hints present,
     // we need to handle the case where clipping moves us to a different row.
-    // This can happen when moving down (Bias::Right) and hitting an inlay hint.
+    // This can happen when moving down (Bias::Right) and hitting an inlay hint, or when
+    // moving up (Bias::Left) into an inlay at the start of a line.
     // Re-clip with opposite bias to stay on the intended line.
     //
     // See: https://github.com/zed-industries/zed/issues/29134
     if clipped_point.row() > point.row() {
         clipped_point = map.clip_point(point, Bias::Left);
+    } else if clipped_point.row() < point.row() {
+        clipped_point = map.clip_point(point, Bias::Right);
     }
 
     (clipped_point, goal)
+}
+
+fn fold_row_start(map: &DisplaySnapshot, row: u32, bias: Bias) -> DisplayPoint {
+    let mut start = map.fold_snapshot().clip_point(FoldPoint::new(row, 0), bias);
+    // The start of a row isn't a valid position when a left-biased inlay sits there (it belongs
+    // to the previous line's end), and clipping it to the left would leave the row.
+    if start.row() < row {
+        start = map
+            .fold_snapshot()
+            .clip_point(FoldPoint::new(row, 0), Bias::Right);
+    }
+    map.fold_point_to_display_point(start)
 }
 
 fn down_display(
